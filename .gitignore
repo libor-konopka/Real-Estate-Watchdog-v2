@@ -1,0 +1,24 @@
+# --- Environment isolation (uv) ---
+.venv/
+
+# --- Local tool configuration (PyCharm) ---
+.idea/
+
+# --- Compiled output and cache (Python) ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Secrets and identities (Environment variables) ---
+.env
+.env.*
+*.pem
+
+# --- Physical storage and volumes (Docker, Lakehouse, Data) ---
+data/
+postgres_data/
+minio_data/
+
+# --- Orchestration and logs (Dagster) ---
+dagster_home/
+*.log
