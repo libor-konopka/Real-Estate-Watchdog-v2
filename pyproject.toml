@@ -2,4 +2,24 @@
 name = "real-estate-watchdog-v2"
 version = "0.1.0"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "aiohttp>=3.14.3",
+    "asyncpg>=0.31.0",
+    "beautifulsoup4>=4.15.0",
+    "dagster==1.13.24",
+    "duckdb>=1.5.5",
+    "loguru>=0.7.3",
+    "polars==1.44.2",
+    "pyarrow>=25.0.1",
+    "pydantic>=2.13.5",
+    "selectolax>=0.4.11",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "ruff>=0.16.6",
+]
+
+[tool.ruff.lint]
+unfixable = ["F401"]
