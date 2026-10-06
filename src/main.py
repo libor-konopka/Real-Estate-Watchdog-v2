@@ -9,7 +9,7 @@ from loguru import logger
 
 from src.contracts.portals.bazos import BazosRawInput
 from src.scrapers.bazos_scraper import BazosScraper
-from src.transformations.bronze import get_known_source_ids, save_to_parquet
+from src.transformations.bronze import get_known_source_ids, save_to_iceberg
 from src.transformations.silver import process_silver
 
 
@@ -75,23 +75,10 @@ async def run_pipeline() -> None:
                     )
 
                 # Bronze layer materialization
-                save_to_parquet(accumulated_entities, transaction, entity)
-
-                bronze_file = (
-                    project_root
-                    / "data"
-                    / "bronze"
-                    / f"bazos_{transaction}_{entity}.parquet"
-                )
-                silver_file = (
-                    project_root
-                    / "data"
-                    / "silver"
-                    / f"bazos_{transaction}_{entity}.parquet"
-                )
+                save_to_iceberg(accumulated_entities, transaction, entity)
 
                 # Silver layer transformations
-                process_silver(bronze_file, silver_file)
+                process_silver(transaction, entity)
 
                 logger.info(
                     f"Successfully extracted and transformed {len(accumulated_entities)} NEW/UPDATED listings for: {transaction} {entity}"

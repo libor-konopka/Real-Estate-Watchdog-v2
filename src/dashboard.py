@@ -2,35 +2,38 @@ from pathlib import Path
 
 import polars as pl
 import streamlit as st
+from pyiceberg.catalog import load_catalog
+from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def load_data(transaction: str, entity: str) -> pl.DataFrame:
-    """
-    Loads data from a local Parquet file into a Polars DataFrame.
-    Implements caching to prevent redundant disk I/O on UI interactions.
-    """
-    # Dynamic construction of the absolute path from the dashboard.py location
-    current_dir = Path(__file__).resolve().parent
-    project_root = current_dir.parent
-
-    file_path = (
-        project_root / "data" / "silver" / f"bazos_{transaction}_{entity}.parquet"
-    )
-
-    if not file_path.exists():
-        return pl.DataFrame()
-
+    """Načítá data z Iceberg tabulky ve vrstvě Silver."""
     try:
-        df = pl.read_parquet(file_path)
+        catalog = load_catalog(
+            "default",
+            **{
+                "type": "rest",
+                "uri": "http://localhost:19120/iceberg/",
+                "s3.endpoint": "http://localhost:9000",
+                "s3.access-key-id": "admin",
+                "s3.secret-access-key": "password",
+                "s3.region": "us-east-1",
+                "s3.path-style-access": "true",
+                "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
+            },
+        )
+        table = catalog.load_table(f"silver.bazos_{transaction}_{entity}")
+        df = pl.scan_iceberg(table).collect()
 
         if "available_from" in df.columns:
             df = df.with_columns(pl.col("available_from").cast(pl.Date))
 
         return df
+    except NoSuchTableError, NoSuchNamespaceError:
+        return pl.DataFrame()
     except Exception as e:
-        # Prevents app crash and displays a localized error in the UI
-        st.error(f"Failed to load data from {file_path.name}: {e}")
+        st.error(f"Failed to load data from Iceberg: {e}")
         return pl.DataFrame()
 
 
