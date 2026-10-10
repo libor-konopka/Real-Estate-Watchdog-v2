@@ -1,19 +1,23 @@
+import os
+
 import polars as pl
 from loguru import logger
 from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
 
-# Inicializace katalogu (stejná jako v bronze.py)
+# Pověření pouze pro lokální s3fs komunikaci s MinIO
+os.environ["AWS_ACCESS_KEY_ID"] = "admin"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "password"
+os.environ["AWS_ENDPOINT_URL"] = "http://localhost:9000"
+os.environ["AWS_ALLOW_HTTP"] = "true"
+os.environ["AWS_REGION"] = "us-east-1"
+
 catalog = load_catalog(
     "default",
     **{
         "type": "rest",
         "uri": "http://localhost:19120/iceberg/",
         "s3.endpoint": "http://localhost:9000",
-        "s3.access-key-id": "admin",
-        "s3.secret-access-key": "password",
-        "s3.region": "us-east-1",
-        "s3.path-style-access": "true",
         "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
     },
 )
@@ -89,7 +93,6 @@ def process_silver(transaction: str, entity_type: str) -> None:
             table = catalog.create_table(
                 identifier=silver_identifier,
                 schema=arrow_table.schema,
-                location=f"s3://warehouse/{silver_namespace}/{silver_table_name}",
             )
             table.append(arrow_table)
 

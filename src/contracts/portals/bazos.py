@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 from pydantic import field_validator
 
+
 # Absolute imports from immutable core system
 from src.contracts.base import (
     BuildingCondition,
@@ -209,23 +210,33 @@ class BazosRawInput(BasePortalInput):
         return legal
 
     def _parse_land_area(self) -> float | None:
-        """Extracts land area in square meters."""
+        """Extracts land area in square meters. Accumulates multiple parcels if present."""
         for text in (self.raw_description, self.raw_title):
             if not text:
                 continue
 
-            if match := (
-                patterns.RE_LAND_AREA_FWD.search(text)
-                or patterns.RE_LAND_AREA_REV.search(text)
-                or patterns.RE_LAND_AREA_STRUCT.search(text)
+            total_area = 0.0
+            found = False
+
+            # Iterujeme přes vzory a sčítáme všechny nalezené parcely
+            for pattern in (
+                patterns.RE_LAND_AREA_FWD,
+                patterns.RE_LAND_AREA_REV,
+                patterns.RE_LAND_AREA_STRUCT,
             ):
-                clean_number = re.sub(r"\s+", "", match.group(1)).replace(",", ".")
-                try:
-                    return float(clean_number)
-                except ValueError:
-                    logger.warning(
-                        f"Failed to parse land area: '{match.group(1)}' in {self.raw_url}"
-                    )
+                for match in pattern.finditer(text):
+                    clean_number = re.sub(r"\s+", "", match.group(1)).replace(",", ".")
+                    try:
+                        total_area += float(clean_number)
+                        found = True
+                    except ValueError:
+                        logger.warning(
+                            f"Failed to parse land area segment: '{match.group(1)}' in {self.raw_url}"
+                        )
+
+                # Pokud tento vzor něco našel, vrátíme celkový součet a nepokračujeme dalším vzorem
+                if found:
+                    return total_area
 
         return None
 
@@ -426,3 +437,5 @@ class BazosRawInput(BasePortalInput):
                 energy_class=energy_class,
                 description=self.raw_description,
             )
+
+

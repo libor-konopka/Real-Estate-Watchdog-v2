@@ -1,5 +1,7 @@
 import asyncio
+import http.client
 import itertools
+import logging
 import socket
 import sys
 from pathlib import Path
@@ -9,7 +11,12 @@ from loguru import logger
 
 from src.contracts.portals.bazos import BazosRawInput
 from src.scrapers.bazos_scraper import BazosScraper
-from src.transformations.bronze import get_known_source_ids, save_to_iceberg
+from src.scrapers.reconciliation import BazosReconciler
+from src.transformations.bronze import (
+    get_active_bronze_properties,
+    get_known_source_ids,
+    save_to_iceberg,
+)
 from src.transformations.silver import process_silver
 
 
@@ -46,18 +53,18 @@ async def run_pipeline() -> None:
     entities = BazosRawInput.get_supported_entities()
     targets = list(itertools.product(transactions, entities))
 
-    resolver = aiohttp.ThreadedResolver()
-    connector = aiohttp.TCPConnector(
-        resolver=resolver, family=socket.AF_INET, use_dns_cache=True, limit=50
-    )
-
     project_root = Path(__file__).resolve().parent.parent
 
-    async with aiohttp.ClientSession(connector=connector) as session:
-        scraper = BazosScraper(session)
+    for transaction, entity in targets:
+        try:
+            resolver = aiohttp.ThreadedResolver()
+            connector = aiohttp.TCPConnector(
+                resolver=resolver, family=socket.AF_INET, use_dns_cache=True, limit=50
+            )
 
-        for transaction, entity in targets:
-            try:
+            async with aiohttp.ClientSession(connector=connector) as session:
+                scraper = BazosScraper(session)
+
                 known_data = get_known_source_ids(transaction, entity)
                 logger.info(
                     f"Data extraction initiated for Bazos: {transaction}/{entity} "
@@ -84,11 +91,42 @@ async def run_pipeline() -> None:
                     f"Successfully extracted and transformed {len(accumulated_entities)} NEW/UPDATED listings for: {transaction} {entity}"
                 )
 
-            except Exception as e:
-                logger.error(
-                    f"Pipeline failed for category {transaction}/{entity}: {e}"
+                # ---------------------------------------------------------
+                # NOVÝ KROK: AUDIT A DEAKTIVACE SMAZANÝCH INZERÁTŮ
+                # ---------------------------------------------------------
+                logger.info(
+                    f"Zahajuji audit existence inzerátů na portálu pro: {transaction}/{entity}..."
                 )
-                continue
+
+                # 1. Načteme všechny, o kterých si myslíme, že jsou aktivní
+                active_properties = get_active_bronze_properties(transaction, entity)
+
+                if active_properties:
+                    # 2. Asynchronně je zkontrolujeme
+                    reconciler = BazosReconciler(session)
+                    tombstones = await reconciler.verify_and_deactivate(
+                        active_properties
+                    )
+
+                    if tombstones:
+                        # 3. Vytvořené neaktivní kopie přilepíme do historie (Bronze)
+                        save_to_iceberg(tombstones, transaction, entity)
+
+                        # 4. Spustíme znovu promítnutí do analytické vrstvy (Silver)
+                        # Deduplikační krok keep="last" nahradí starý True stav novým False stavem
+                        process_silver(transaction, entity)
+                        logger.info(
+                            f"Úspěšně deaktivováno {len(tombstones)} odstraněných inzerátů."
+                        )
+                # ---------------------------------------------------------
+
+        except Exception as e:
+            logger.error(f"Pipeline failed for category {transaction}/{entity}: {e}")
+            continue
+
+        # 2. Krátká pauza mezi kategoriemi (po uzavření session) pro snížení zátěže
+        logger.info("Vyčkávám 2 sekundy před zahájením další kategorie...")
+        await asyncio.sleep(2)
 
 
 if __name__ == "__main__":
@@ -97,5 +135,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("The data flow was manually interrupted.")
     except Exception as e:
-        # Fallback rescue from an uncontrolled application crash at the system level
         logger.critical(f"Fatal error in main data flow: {e}")

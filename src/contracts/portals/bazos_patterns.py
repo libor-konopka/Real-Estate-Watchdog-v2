@@ -67,7 +67,7 @@ RE_AVAILABLE_REV = re.compile(
 # AREA EXTRACTION (Land)
 # ==========================================
 RE_LAND_AREA_FWD = re.compile(
-    r"(?:pozem\w+|zahrad\w+|parcel\w+|dv[ůo]r\w*)\D{0,30}?(\d+(?:[ \xa0]\d+)*(?:[.,]\d+)?)\s*(?:m[2²\'’´`]?|metr\w*)(?=[.,\s]|$)",
+    r"(?:pozem\w+|zahrad\w+|parcel\w+|dv[ůo]r\w*|výměr\w*)\D{0,30}?(\d+(?:[ \xa0]\d+)*(?:[.,]\d+)?)\s*(?:m[2²\'’´`]?|metr\w*)(?=[.,\s]|$)",
     re.IGNORECASE,
 )
 RE_LAND_AREA_REV = re.compile(
@@ -171,7 +171,4 @@ RE_ENERGY_CLASS = re.compile(
 # ==========================================
 # LOCATION (ZIP code and municipality)
 # ==========================================
-RE_LOCATION = re.compile(
-    r"(?:(?:PSČ|PSC)?\s*(\d{3}\s?\d{2}))?\s*(.*)",
-    re.IGNORECASE
-)
+RE_LOCATION = re.compile(r"(?:(?:PSČ|PSC)?\s*(\d{3}\s?\d{2}))?\s*(.*)", re.IGNORECASE)

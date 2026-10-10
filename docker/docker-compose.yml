@@ -34,13 +34,14 @@ services:
       - "19120:19120"
     environment:
       - QUARKUS_HTTP_PORT=19120
-      - NESSIE_CATALOG_DEFAULT_WAREHOUSE=default
-      - NESSIE_CATALOG_WAREHOUSES_DEFAULT_LOCATION=s3://warehouse
-      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT=http://minio:9000
-      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY=admin
-      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_SECRET_KEY=password
-      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION=us-east-1
-      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS=true
-      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_AUTH_TYPE=STATIC
+      - nessie.catalog.default-warehouse=default
+      - nessie.catalog.warehouses.default.location=s3://warehouse/
+      - nessie.catalog.service.s3.default-options.endpoint=http://minio:9000
+      - nessie.catalog.service.s3.default-options.region=us-east-1
+      - nessie.catalog.service.s3.default-options.path-style-access=true
+      - nessie.catalog.service.s3.default-options.auth-type=STATIC
+      - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
+      - nessie.catalog.secrets.access-key.name=admin
+      - nessie.catalog.secrets.access-key.secret=password
 volumes:
   minio_data:

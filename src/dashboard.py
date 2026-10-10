@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import polars as pl
@@ -9,6 +10,14 @@ from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 @st.cache_data(ttl=60)
 def load_data(transaction: str, entity: str) -> pl.DataFrame:
     """Načítá data z Iceberg tabulky ve vrstvě Silver."""
+
+    # Pověření pro podkladovou vrstvu s3fs (vyhne se odeslání do Nessie REST API)
+    os.environ["AWS_ACCESS_KEY_ID"] = "admin"
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "password"
+    os.environ["AWS_ENDPOINT_URL"] = "http://localhost:9000"
+    os.environ["AWS_ALLOW_HTTP"] = "true"
+    os.environ["AWS_REGION"] = "us-east-1"
+
     try:
         catalog = load_catalog(
             "default",
@@ -16,10 +25,6 @@ def load_data(transaction: str, entity: str) -> pl.DataFrame:
                 "type": "rest",
                 "uri": "http://localhost:19120/iceberg/",
                 "s3.endpoint": "http://localhost:9000",
-                "s3.access-key-id": "admin",
-                "s3.secret-access-key": "password",
-                "s3.region": "us-east-1",
-                "s3.path-style-access": "true",
                 "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
             },
         )
@@ -62,10 +67,24 @@ def main() -> None:
         ],
     )
 
+    # Přidání přepínače do sidebaru
+    st.sidebar.divider()
+    show_inactive = st.sidebar.checkbox(
+        "Zobrazit i smazané inzeráty (historie)", value=False
+    )
+
     df = load_data(transaction, entity)
 
     if df.is_empty():
         st.warning(f"Žádná data pro kombinaci: {transaction} {entity}")
+        return
+
+    # Vyfiltrování smazaných inzerátů z výpočtů a tabulky
+    if not show_inactive:
+        df = df.filter(pl.col("is_active") == True)
+
+    if df.is_empty():
+        st.info("V této kategorii nejsou žádné aktivní inzeráty.")
         return
 
     # Aggregation

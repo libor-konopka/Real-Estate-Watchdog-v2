@@ -1,26 +1,32 @@
+import os
+
 import polars as pl
 import pyarrow as pa
 from loguru import logger
+from pydantic import TypeAdapter
 from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import (
     NamespaceAlreadyExistsError,
     NoSuchNamespaceError,
     NoSuchTableError,
 )
+from pyiceberg.io.pyarrow import schema_to_pyarrow
 
 from src.contracts.portals.base import AnyProperty
 
-# Inicializace Iceberg REST katalogu směrovaného na lokální Nessie a MinIO
+# Pověření pouze pro lokální s3fs komunikaci s MinIO
+os.environ["AWS_ACCESS_KEY_ID"] = "admin"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "password"
+os.environ["AWS_ENDPOINT_URL"] = "http://localhost:9000"
+os.environ["AWS_ALLOW_HTTP"] = "true"
+os.environ["AWS_REGION"] = "us-east-1"
+
 catalog = load_catalog(
     "default",
     **{
         "type": "rest",
         "uri": "http://localhost:19120/iceberg/",
         "s3.endpoint": "http://localhost:9000",
-        "s3.access-key-id": "admin",
-        "s3.secret-access-key": "password",
-        "s3.region": "us-east-1",
-        "s3.path-style-access": "true",
         "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
     },
 )
@@ -89,6 +95,8 @@ def save_to_iceberg(
 
         try:
             table = catalog.load_table(table_identifier)
+            target_schema = schema_to_pyarrow(table.schema())
+            arrow_table = arrow_table.cast(target_schema)
             table.append(arrow_table)
         except NoSuchTableError:
             table = catalog.create_table(
@@ -105,3 +113,30 @@ def save_to_iceberg(
             f"Failed to save bronze layer to Iceberg table {table_identifier}: {e}"
         )
         raise
+
+
+def get_active_bronze_properties(
+    transaction: str, entity_type: str
+) -> list[AnyProperty]:
+    """Načte, deduplikuje a rekonstruuje aktivní Pydantic modely z vrstvy Bronze."""
+    table_identifier = f"bronze.bazos_{transaction}_{entity_type}"
+    try:
+        table = catalog.load_table(table_identifier)
+        df = pl.scan_iceberg(table).collect()
+
+        if df.is_empty():
+            return []
+
+        # Deduplikujeme (najdeme nejnovější stav každého ID) a vyfiltrujeme jen ty aktivní
+        df = df.unique(subset=["source_id"], keep="last")
+        df = df.filter(pl.col("is_active") == True)
+
+        # Pydantic TypeAdapter se postará o dynamické naparsování slovníků zpět na House/Land/atd.
+        adapter = TypeAdapter(AnyProperty)
+        return [adapter.validate_python(row) for row in df.to_dicts()]
+
+    except NoSuchTableError, NoSuchNamespaceError:
+        return []
+    except Exception as e:
+        logger.error(f"Nepodařilo se načíst aktivní záznamy z {table_identifier}: {e}")
+        return []
