@@ -7,11 +7,13 @@ dependencies = [
     "asyncpg>=0.31.0",
     "beautifulsoup4>=4.15.0",
     "dagster==1.13.24",
+    "dagster-webserver>=1.13.24",
     "duckdb>=1.5.5",
     "loguru>=0.7.3",
     "polars==1.44.2",
     "pyarrow>=25.0.1",
     "pydantic>=2.13.5",
+    "pydantic-settings>=2.16.0",
     "pyiceberg[s3fs]>=0.12.0",
     "selectolax>=0.4.11",
 ]
@@ -24,3 +26,6 @@ dev = [
 
 [tool.ruff.lint]
 unfixable = ["F401"]
+
+[tool.dagster]
+module_name = "src.orchestration.definitions"

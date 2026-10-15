@@ -1,5 +1,4 @@
 from datetime import date
-from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
@@ -65,6 +64,7 @@ class Location(BaseModel):
     region: str | None = None
     district: str | None = None
     municipality: str | None = None
+    postal_code: str | None = None
     gps: GPSCoordinates | None = None
 
 
@@ -157,8 +157,8 @@ class BaseProperty(BaseModel):
     Acts as an impenetrable shield against external data chaos.
     """
 
-    # Model immune system: absolute rejection of unknown anomalies and state mutations
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    # Model
+    model_config = ConfigDict(extra="ignore", frozen=True)
 
     # Identity
     id: str
@@ -173,7 +173,7 @@ class BaseProperty(BaseModel):
     entity_type: EntityType
 
     # Financial energy
-    price: Decimal | None = None
+    price: float | None = None
     currency: Currency | None = None
 
     # Time anchor (requires timezone-aware object)
@@ -220,3 +220,13 @@ class LandProperty(BaseProperty):
     location_character: str | None = None
     access_road: str | None = None
     transport: str | None = None
+
+
+class ActiveListingRef(BaseModel):
+    """Lightweight projection used strictly for reconciliation audits."""
+
+    id: str
+    source_id: str
+    url: HttpUrl
+    transaction_type: TransactionType
+    entity_type: EntityType

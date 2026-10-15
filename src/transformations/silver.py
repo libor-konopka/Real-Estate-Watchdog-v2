@@ -1,29 +1,77 @@
-import os
-
 import polars as pl
+import pyarrow as pa
 from loguru import logger
-from pyiceberg.catalog import load_catalog
-from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
-
-# Pověření pouze pro lokální s3fs komunikaci s MinIO
-os.environ["AWS_ACCESS_KEY_ID"] = "admin"
-os.environ["AWS_SECRET_ACCESS_KEY"] = "password"
-os.environ["AWS_ENDPOINT_URL"] = "http://localhost:9000"
-os.environ["AWS_ALLOW_HTTP"] = "true"
-os.environ["AWS_REGION"] = "us-east-1"
-
-catalog = load_catalog(
-    "default",
-    **{
-        "type": "rest",
-        "uri": "http://localhost:19120/iceberg/",
-        "s3.endpoint": "http://localhost:9000",
-        "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
-    },
+from pyiceberg.exceptions import (
+    NamespaceAlreadyExistsError,
+    NoSuchNamespaceError,
+    NoSuchTableError,
 )
+from pyiceberg.io.pyarrow import pyarrow_to_schema
+from pyiceberg.table import Table
+
+from src.contracts.base import SourcePortal
+from src.contracts.schemas import SILVER_PROPERTY_ARROW_SCHEMA
+from src.storage.catalog import get_catalog
+from src.transformations.enrichment import load_geo_lookup_df
+
+BRONZE_NAMESPACE = "bronze"
+SILVER_NAMESPACE = "silver"
+
+
+def _align_to_silver_schema(df: pl.DataFrame) -> pa.Table:
+    """
+    Ensures all Silver schema fields exist and converts DataFrame
+    into a strictly typed PyArrow Table matching SILVER_PROPERTY_ARROW_SCHEMA.
+    """
+    for field in SILVER_PROPERTY_ARROW_SCHEMA:
+        if field.name not in df.columns:
+            df = df.with_columns(pl.lit(None).alias(field.name))
+
+    df = df.select([f.name for f in SILVER_PROPERTY_ARROW_SCHEMA])
+    raw_arrow = df.to_arrow()
+
+    # Bezpečné přetypování sloupců na explicitní typy
+    arrays = []
+    for field in SILVER_PROPERTY_ARROW_SCHEMA:
+        col = raw_arrow.column(field.name)
+        if col.type == pa.null() and pa.types.is_nested(field.type):
+            arrays.append(pa.nulls(len(raw_arrow), type=field.type))
+        else:
+            arrays.append(col.cast(field.type))
+
+    return pa.Table.from_arrays(arrays, schema=SILVER_PROPERTY_ARROW_SCHEMA)
+
+
+def _get_table_identifiers(source: SourcePortal | str) -> tuple[str, str]:
+    source_str = source.value if isinstance(source, SourcePortal) else source
+    return (
+        f"{BRONZE_NAMESPACE}.{source_str}_properties",
+        f"{SILVER_NAMESPACE}.{source_str}_properties",
+    )
+
+
+def extract_and_enrich_location(df: pl.DataFrame) -> pl.DataFrame:
+    """Unnests location struct and enriches region/district via Polars join."""
+    if "location" in df.columns:
+        df = df.unnest("location")
+
+    geo_df = load_geo_lookup_df()
+
+    if "postal_code" in df.columns and not geo_df.is_empty():
+        df = df.join(geo_df, on="postal_code", how="left")
+        df = df.with_columns(
+            pl.coalesce(["region", "enriched_region"]).alias("region"),
+            pl.coalesce(["district", "enriched_district"]).alias("district"),
+            pl.coalesce(["municipality", "enriched_municipality"]).alias(
+                "municipality"
+            ),
+        ).drop(["enriched_region", "enriched_district", "enriched_municipality"])
+
+    return df
 
 
 def clean_infrastructure(df: pl.DataFrame) -> pl.DataFrame:
+    """Unnests infrastructure fields and fills baseline electricity defaults."""
     if "infrastructure" in df.columns:
         df = df.unnest("infrastructure")
 
@@ -40,13 +88,8 @@ def clean_infrastructure(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def clean_financials(df: pl.DataFrame) -> pl.DataFrame:
-    if "price" in df.columns:
-        df = df.with_columns(pl.col("price").cast(pl.Float64, strict=False))
-    return df
-
-
 def clean_legal_context(df: pl.DataFrame) -> pl.DataFrame:
+    """Unnests legal context struct and ensures ISO date parsing."""
     if "legal" in df.columns:
         df = df.unnest("legal")
         if "available_from" in df.columns:
@@ -54,35 +97,49 @@ def clean_legal_context(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def process_silver(transaction: str, entity_type: str) -> None:
-    """Načte data z Bronze Icebergu, deduplikuje, vyčistí a přepíše Silver Iceberg tabulku."""
-    bronze_identifier = f"bronze.bazos_{transaction}_{entity_type}"
-    silver_namespace = "silver"
-    silver_table_name = f"bazos_{transaction}_{entity_type}"
-    silver_identifier = f"{silver_namespace}.{silver_table_name}"
+def compute_derived_metrics(df: pl.DataFrame) -> pl.DataFrame:
+    """Computes analytical metrics like price per square meter."""
+    area_col = pl.coalesce(["usable_area_m2", "land_area_m2", "built_up_area_m2"])
+
+    df = df.with_columns(
+        pl.when((pl.col("price").is_not_null()) & (area_col > 0))
+        .then((pl.col("price") / area_col).round(2))
+        .otherwise(None)
+        .alias("price_per_m2")
+    )
+    return df
+
+
+def process_silver(source: SourcePortal | str) -> Table | None:
+    """
+    Executes Silver transformation for a specific source.
+    Returns the created/updated Table or None if Bronze is empty.
+    """
+    catalog = get_catalog()
+    bronze_identifier, silver_identifier = _get_table_identifiers(source)
 
     try:
-        # Načtení dat z Bronze
         bronze_table = catalog.load_table(bronze_identifier)
         df = pl.scan_iceberg(bronze_table).collect()
 
         if df.is_empty():
-            return
+            logger.warning(
+                f"Bronze table {bronze_identifier} is empty. Silver skipped."
+            )
+            return None
 
-        # Deduplikace - Bronze je append-only, Silver obsahuje vždy aktuální stav
-        df = df.unique(subset=["source_id"], keep="last")
+        # Deterministic deduplication
+        df = df.sort("scraped_at").unique(subset=["source_id"], keep="last")
 
-        if "location" in df.columns:
-            df = df.unnest("location")
-
+        df = extract_and_enrich_location(df)
         df = clean_infrastructure(df)
-        df = clean_financials(df)
         df = clean_legal_context(df)
+        df = compute_derived_metrics(df)
 
-        arrow_table = df.to_arrow()
+        arrow_table = _align_to_silver_schema(df)
 
         try:
-            catalog.create_namespace(silver_namespace)
+            catalog.create_namespace(SILVER_NAMESPACE)
         except NamespaceAlreadyExistsError:
             pass
 
@@ -92,16 +149,16 @@ def process_silver(transaction: str, entity_type: str) -> None:
         except NoSuchTableError:
             table = catalog.create_table(
                 identifier=silver_identifier,
-                schema=arrow_table.schema,
+                schema=pyarrow_to_schema(arrow_table.schema),
             )
             table.append(arrow_table)
 
-        logger.info(
-            f"Silver layer updated in Iceberg: {silver_identifier} (Records: {df.height})"
-        )
+        logger.info(f"Silver layer updated: {silver_identifier} ({df.height} records)")
+        return table
 
+    except NoSuchTableError, NoSuchNamespaceError:
+        logger.warning(f"Bronze table {bronze_identifier} not found. Skipping Silver.")
+        return None
     except Exception as e:
-        logger.error(
-            f"Failed to process silver layer for {transaction}/{entity_type}: {e}"
-        )
+        logger.error(f"Failed to process Silver for {source}: {e}")
         raise

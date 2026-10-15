@@ -1,8 +1,8 @@
-import csv
-from functools import lru_cache
 from pathlib import Path
 
-# Statická dimenzionální mapa pro odvození kraje z okresu
+import polars as pl
+from loguru import logger
+
 DISTRICT_TO_REGION = {
     "Benešov": "Středočeský",
     "Beroun": "Středočeský",
@@ -84,33 +84,35 @@ DISTRICT_TO_REGION = {
 }
 
 
-@lru_cache(maxsize=1)
-def load_psc_lookup() -> dict[str, dict[str, str]]:
-    """
-    Načte číselník obcí do paměti a dynamicky dopočítá kraj přes statickou mapu okresů.
-    """
-    lookup: dict[str, dict[str, str]] = {}
-
+def load_geo_lookup_df() -> pl.DataFrame:
+    """Loads postal codes lookup and returns a Polars DataFrame with normalized columns."""
     current_dir = Path(__file__).resolve().parent
     project_root = current_dir.parent.parent
     file_path = project_root / "data" / "static" / "psc_kraje.csv"
 
     if not file_path.exists():
-        return lookup
-
-    with open(file_path, mode="r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            psc = row["zipcode"].replace(" ", "")
-            district = row["district"]
-
-            # Párování kraje s fallbackem pro případ neznámého okresu
-            region = DISTRICT_TO_REGION.get(district, "Unknown")
-
-            lookup[psc] = {
-                "region": region,
-                "district": district,
-                "municipality": row["name"],
+        logger.warning(f"Geo lookup dataset not found at {file_path}")
+        return pl.DataFrame(
+            schema={
+                "postal_code": pl.String,
+                "enriched_region": pl.String,
+                "enriched_district": pl.String,
+                "enriched_municipality": pl.String,
             }
+        )
 
-    return lookup
+    df = pl.read_csv(file_path)
+
+    # Normalize postal code (strip whitespace)
+    df = df.with_columns(
+        pl.col("zipcode").str.replace_all(r"\s+", "").alias("postal_code"),
+        pl.col("district")
+        .replace_strict(DISTRICT_TO_REGION, default="Unknown")
+        .alias("enriched_region"),
+        pl.col("district").alias("enriched_district"),
+        pl.col("name").alias("enriched_municipality"),
+    ).select(
+        ["postal_code", "enriched_region", "enriched_district", "enriched_municipality"]
+    )
+
+    return df

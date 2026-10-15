@@ -1,15 +1,13 @@
 import asyncio
-import http.client
 import itertools
-import logging
 import socket
 import sys
-from pathlib import Path
 
 import aiohttp
 from loguru import logger
 
-from src.contracts.portals.bazos import BazosRawInput
+from src.contracts.base import SourcePortal
+from src.contracts.portals.bazos import BazosInputModel
 from src.scrapers.bazos_scraper import BazosScraper
 from src.scrapers.reconciliation import BazosReconciler
 from src.transformations.bronze import (
@@ -18,6 +16,8 @@ from src.transformations.bronze import (
     save_to_iceberg,
 )
 from src.transformations.silver import process_silver
+
+SOURCE = SourcePortal.BAZOS
 
 
 def setup_logger() -> None:
@@ -44,95 +44,111 @@ def setup_logger() -> None:
 
 async def run_pipeline() -> None:
     """
-    Initiates the main data flow. Maintains a global network session and
-    routes the extracted entities for further processing.
+    Initiates the main ELT pipeline for Bazos.
+    Maintains a persistent network session across all sections,
+    extracts active listings, audits deleted entities, and updates Bronze & Silver layers.
     """
     setup_logger()
+    logger.info("Starting real estate ingestion pipeline for Bazos...")
 
-    transactions = BazosRawInput.get_supported_transactions()
-    entities = BazosRawInput.get_supported_entities()
+    transactions = BazosInputModel.get_supported_transactions()
+    entities = BazosInputModel.get_supported_entities()
     targets = list(itertools.product(transactions, entities))
 
-    project_root = Path(__file__).resolve().parent.parent
+    connector = aiohttp.TCPConnector(
+        resolver=aiohttp.ThreadedResolver(),
+        family=socket.AF_INET,
+        use_dns_cache=True,
+        limit=50,
+    )
 
-    for transaction, entity in targets:
-        try:
-            resolver = aiohttp.ThreadedResolver()
-            connector = aiohttp.TCPConnector(
-                resolver=resolver, family=socket.AF_INET, use_dns_cache=True, limit=50
-            )
+    total_scraped = 0
+    total_deactivated = 0
 
-            async with aiohttp.ClientSession(connector=connector) as session:
-                scraper = BazosScraper(session)
+    # Single persistent session for the entire pipeline execution
+    async with aiohttp.ClientSession(connector=connector) as session:
+        scraper = BazosScraper(session)
+        reconciler = BazosReconciler(session)
 
-                known_data = get_known_source_ids(transaction, entity)
+        for transaction, entity in targets:
+            try:
+                tx_enum = BazosInputModel._TRANSACTION_MAP[transaction].value
+                ent_enum = BazosInputModel._ENTITY_MAP[entity].value
+
+                known_data = get_known_source_ids(SOURCE, tx_enum, ent_enum)
                 logger.info(
-                    f"Data extraction initiated for Bazos: {transaction}/{entity} "
+                    f"Scraping category {SOURCE.value}:{transaction}/{entity} "
                     f"(Known records: {len(known_data)})"
                 )
 
+                # 1. Scrape new and updated listings
                 accumulated_entities = []
-
                 async for property_entity in scraper.scrape_section(
                     transaction, entity, known_data
                 ):
                     accumulated_entities.append(property_entity)
                     logger.debug(
-                        f"Entity: {property_entity.id} | Price: {property_entity.price} | URL: {property_entity.url}"
+                        f"Captured {property_entity.source_id} | "
+                        f"Price: {property_entity.price} | {property_entity.url}"
                     )
 
-                # Bronze layer materialization
-                save_to_iceberg(accumulated_entities, transaction, entity)
+                # Materialize raw listings into Bronze Iceberg table
+                if accumulated_entities:
+                    save_to_iceberg(accumulated_entities, source=SOURCE)
+                    total_scraped += len(accumulated_entities)
+                    logger.info(
+                        f"Saved {len(accumulated_entities)} new/updated listings for {transaction}/{entity}"
+                    )
 
-                # Silver layer transformations
-                process_silver(transaction, entity)
-
-                logger.info(
-                    f"Successfully extracted and transformed {len(accumulated_entities)} NEW/UPDATED listings for: {transaction} {entity}"
+                # 2. Reconcile active listings and flag deleted items (tombstones)
+                active_properties = get_active_bronze_properties(
+                    SOURCE, tx_enum, ent_enum
                 )
-
-                # ---------------------------------------------------------
-                # NOVÝ KROK: AUDIT A DEAKTIVACE SMAZANÝCH INZERÁTŮ
-                # ---------------------------------------------------------
-                logger.info(
-                    f"Zahajuji audit existence inzerátů na portálu pro: {transaction}/{entity}..."
-                )
-
-                # 1. Načteme všechny, o kterých si myslíme, že jsou aktivní
-                active_properties = get_active_bronze_properties(transaction, entity)
 
                 if active_properties:
-                    # 2. Asynchronně je zkontrolujeme
-                    reconciler = BazosReconciler(session)
+                    logger.info(
+                        f"Auditing {len(active_properties)} active records for {transaction}/{entity}..."
+                    )
                     tombstones = await reconciler.verify_and_deactivate(
                         active_properties
                     )
 
                     if tombstones:
-                        # 3. Vytvořené neaktivní kopie přilepíme do historie (Bronze)
-                        save_to_iceberg(tombstones, transaction, entity)
-
-                        # 4. Spustíme znovu promítnutí do analytické vrstvy (Silver)
-                        # Deduplikační krok keep="last" nahradí starý True stav novým False stavem
-                        process_silver(transaction, entity)
+                        save_to_iceberg(tombstones, source=SOURCE)
+                        total_deactivated += len(tombstones)
                         logger.info(
-                            f"Úspěšně deaktivováno {len(tombstones)} odstraněných inzerátů."
+                            f"Deactivated {len(tombstones)} removed listings for {transaction}/{entity}"
                         )
-                # ---------------------------------------------------------
 
-        except Exception as e:
-            logger.error(f"Pipeline failed for category {transaction}/{entity}: {e}")
-            continue
+            except Exception as e:
+                logger.error(
+                    f"Error processing category {transaction}/{entity}: {e}",
+                    exc_info=True,
+                )
+                continue
 
-        # 2. Krátká pauza mezi kategoriemi (po uzavření session) pro snížení zátěže
-        logger.info("Vyčkávám 2 sekundy před zahájením další kategorie...")
-        await asyncio.sleep(2)
+            await asyncio.sleep(1.0)
+
+    # 3. Silver Layer Transformation
+    # Run once at the end of the entire extraction process
+    if total_scraped > 0 or total_deactivated > 0:
+        logger.info(
+            f"Extraction complete (New/Updated: {total_scraped}, Deactivated: {total_deactivated}). "
+            "Running Silver transformation..."
+        )
+        process_silver(source=SOURCE)
+        logger.info("Silver layer processing completed successfully.")
+    else:
+        logger.info(
+            "No updates detected across any section. Silver processing skipped."
+        )
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(run_pipeline())
     except KeyboardInterrupt:
-        logger.info("The data flow was manually interrupted.")
+        logger.warning("Pipeline execution interrupted by user.")
     except Exception as e:
-        logger.critical(f"Fatal error in main data flow: {e}")
+        logger.critical(f"Fatal error in pipeline execution: {e}", exc_info=True)
+        sys.exit(1)

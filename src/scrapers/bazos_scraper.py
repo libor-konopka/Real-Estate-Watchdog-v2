@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 from loguru import logger
 
 from src.contracts.portals.base import AnyProperty
-from src.contracts.portals.bazos import BazosRawInput
+from src.contracts.portals.bazos import BazosInputModel
 from src.scrapers.bazos_parser import BazosDOMParser
 
 
@@ -40,9 +40,8 @@ class BazosScraper:
         max_retries: int = 3,
     ) -> AnyProperty | None:
         """
-        Fetches a single advertisement detail and materializes it into a domain entity.
-        Includes a retry mechanism to overcome network instability and is protected
-        by a semaphore against overloading the target server.
+        Fetches an individual listing page, parses DOM via selectolax,
+        and returns a materialized domain property.
         """
         async with self._semaphore:
             for attempt in range(1, max_retries + 1):
@@ -52,149 +51,61 @@ class BazosScraper:
                     ) as response:
                         if response.status != 200:
                             logger.warning(
-                                f"Network barrier. Status {response.status} for URL: {entity_url}"
+                                f"Failed to fetch detail (status {response.status}): {entity_url}"
                             )
                             return None
 
                         html_content = await response.text(encoding="utf-8")
 
-                    parser = BazosDOMParser(html_content)
-                    extracted_data = parser.parse_all()
+                    parser = BazosDOMParser(html_content, entity_url)
 
-                    additional_data: dict[str, str] = {
-                        "raw_url": entity_url,
-                        "raw_transaction": raw_transaction,
-                        "raw_entity": raw_entity,
-                    }
-                    extracted_data |= additional_data
+                    title = parser.extract_title()
+                    description = parser.extract_description()
+                    price, currency = parser.extract_price()
+                    location, postal_code = parser.extract_location()
 
-                    return BazosRawInput(**extracted_data).materialize()
+                    combined_text = f"{title} {description}"
+
+                    input_model = BazosInputModel(
+                        url=entity_url,
+                        raw_transaction=raw_transaction,
+                        raw_entity=raw_entity,
+                        title=title,
+                        description=description,
+                        price=price,
+                        currency=currency,
+                        location=location,
+                        postal_code=postal_code,
+                        infrastructure=parser.extract_infrastructure(description),
+                        legal=parser.extract_legal_context(description, title),
+                        usable_area_m2=parser.extract_usable_area(title, description),
+                        land_area_m2=parser.extract_land_area(title, description),
+                        built_up_area_m2=parser.extract_built_up_area(
+                            title, description
+                        ),
+                        material=parser.extract_material(combined_text),
+                        condition=parser.extract_condition(combined_text),
+                        energy_class=parser.extract_energy_class(combined_text),
+                    )
+
+                    return input_model.materialize()
 
                 except (TimeoutError, aiohttp.ClientError) as e:
                     if attempt == max_retries:
-                        logger.warning(
-                            f"Connection with {entity_url} definitely failed: {e}"
-                        )
+                        logger.error(f"Exceeded max retries for {entity_url}: {e}")
                         return None
 
-                    wait_time = 3 * attempt
+                    wait_seconds = 2 * attempt
                     logger.debug(
-                        f"Barrier in the network. The system breathes {wait_time} s "
-                        f"and repeats the attempt for the detail ({attempt}/{max_retries})..."
+                        f"Network issue on {entity_url}. Backoff {wait_seconds}s "
+                        f"(attempt {attempt}/{max_retries})."
                     )
-                    await asyncio.sleep(wait_time)
+                    await asyncio.sleep(wait_seconds)
 
                 except Exception as e:
-                    # Irrecoverable errors (e.g., data parsing) are not retried
-                    logger.warning(f"Error while processing {entity_url}: {e}")
+                    logger.error(
+                        f"Unrecoverable parsing/validation error for {entity_url}: {e}"
+                    )
                     return None
 
             return None
-
-    async def scrape_section(
-        self,
-        raw_transaction: str,
-        raw_entity: str,
-        known_data: dict[str, str] | None = None,
-    ) -> AsyncGenerator[AnyProperty]:
-        """
-        Asynchronous generator that iterates through the paginated list of advertisements.
-        Filters out known unchanged listings and yields new or updated domain entities.
-        """
-        known_data = known_data or {}
-        offset = 0
-        consecutive_known_pages = 0
-
-        while True:
-            current_url = f"{self.base_url}/{raw_transaction}/{raw_entity}/"
-            if offset > 0:
-                current_url += f"{offset}/"
-
-            try:
-                async with self.session.get(
-                    current_url, headers=self._HEADERS
-                ) as response:
-                    if response.status != 200:
-                        logger.info(
-                            f"End of flow or barrier reached at {current_url} (status {response.status})."
-                        )
-                        break
-
-                    list_html = await response.text(encoding="utf-8")
-
-                soup = BeautifulSoup(list_html, "lxml")
-                new_detail_urls: list[str] = []
-
-                for container in soup.find_all("div", class_="inzeraty"):
-                    if not (h2 := container.find("h2", class_="nadpis")):
-                        continue
-
-                    if (a_tag := h2.find("a")) and "href" in a_tag.attrs:
-                        detail_path = str(a_tag["href"])
-
-                        if match := re.search(r"/inzerat/(\d+)/", detail_path):
-                            source_id = match.group(1)
-                            current_price = ""
-
-                            if price_tag := container.find(
-                                "div", class_="inzeratycena"
-                            ):
-                                current_price = re.sub(
-                                    r"[^\d]", "", price_tag.get_text()
-                                )
-
-                            if source_id in known_data:
-                                historical_price = re.sub(
-                                    r"[^\d]", "", str(known_data[source_id])
-                                )
-
-                                if current_price == historical_price:
-                                    continue
-                                else:
-                                    logger.debug(
-                                        f"Price change detected for ID {source_id}: "
-                                        f"{historical_price} -> {current_price}"
-                                    )
-
-                        full_url = (
-                            f"{self.base_url}{detail_path}"
-                            if detail_path.startswith("/")
-                            else f"{self.base_url}/{detail_path}"
-                        )
-                        new_detail_urls.append(full_url)
-
-                if not new_detail_urls:
-                    consecutive_known_pages += 1
-                    if consecutive_known_pages >= 3:
-                        logger.info(
-                            "Historical bottom reached (3 consecutive pages of known listings). "
-                            "Ending section."
-                        )
-                        break
-
-                    offset += 20
-                    continue
-
-                consecutive_known_pages = 0
-
-                # Safe execution of asynchronous tasks thanks to semaphore protection
-                tasks = [
-                    self._process_detail(url, raw_transaction, raw_entity)
-                    for url in new_detail_urls
-                ]
-
-                results = await asyncio.gather(*tasks)
-
-                for entity in results:
-                    if entity is not None:
-                        yield entity
-
-                offset += 20
-
-            except (TimeoutError, aiohttp.ClientError) as e:
-                logger.warning(f"Network error while fetching URL {current_url}: {e}")
-                await asyncio.sleep(5.0)
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error processing section {current_url}: {e}")
-                break
