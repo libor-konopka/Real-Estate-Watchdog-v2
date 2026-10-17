@@ -1,3 +1,4 @@
+from functools import lru_cache
 from pathlib import Path
 
 import polars as pl
@@ -84,6 +85,7 @@ DISTRICT_TO_REGION = {
 }
 
 
+@lru_cache(maxsize=1)
 def load_geo_lookup_df() -> pl.DataFrame:
     """Loads postal codes lookup and returns a Polars DataFrame with normalized columns."""
     current_dir = Path(__file__).resolve().parent

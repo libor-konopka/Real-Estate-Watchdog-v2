@@ -1,7 +1,6 @@
 import polars as pl
 import pyarrow as pa
 from loguru import logger
-from pydantic import TypeAdapter
 from pyiceberg.exceptions import (
     NamespaceAlreadyExistsError,
     NoSuchNamespaceError,
@@ -18,14 +17,18 @@ NAMESPACE = "bronze"
 
 
 def _get_table_identifier(source: SourcePortal | str) -> str:
+    """Constructs the fully qualified table identifier for Iceberg."""
     source_str = source.value if isinstance(source, SourcePortal) else source
     return f"{NAMESPACE}.{source_str}_properties"
 
 
 def get_known_source_ids(
     source: SourcePortal | str, transaction: str, entity_type: str
-) -> dict[str, str]:
-    """Loads existing Iceberg table and returns source_id -> price mapping."""
+) -> dict[str, float | None]:
+    """
+    Loads existing Bronze Iceberg table and returns a mapping of source_id -> price.
+    Used for incremental scraping to detect price changes or skip existing listings.
+    """
     catalog = get_catalog()
     table_identifier = _get_table_identifier(source)
 
@@ -54,6 +57,7 @@ def save_to_iceberg(
     """
     Directly materializes domain entities or tombstone dicts into an Arrow Table
     matching PROPERTY_ARROW_SCHEMA and appends to the Bronze Iceberg table.
+    Bypasses Polars DataFrame creation to prevent struct casting errors on null values.
     """
     if not entities:
         return
@@ -61,15 +65,14 @@ def save_to_iceberg(
     catalog = get_catalog()
     table_identifier = _get_table_identifier(source)
 
-    # Převod entit na serializovatelné slovníky pro PyArrow
-    records = []
+    records: list[dict] = []
     for item in entities:
         if isinstance(item, dict):
             row = item
         else:
             row = item.model_dump(mode="python")
 
-        # Úprava typů nekompatibilních s čistým from_pylist
+        # Normalize non-Arrow serializable types
         if "url" in row and row["url"] is not None:
             row["url"] = str(row["url"])
         if "price" in row and row["price"] is not None:
@@ -77,7 +80,7 @@ def save_to_iceberg(
 
         records.append(row)
 
-    # Přímá konstrukce Arrow tabulky - bezpečně vytvoří struct null buffery i chybějící sloupce
+    # Directly build Arrow Table with enforced schema; handles missing nested fields cleanly
     arrow_table = pa.Table.from_pylist(records, schema=PROPERTY_ARROW_SCHEMA)
 
     try:
@@ -101,3 +104,51 @@ def save_to_iceberg(
     except Exception as e:
         logger.error(f"Failed to append records to {table_identifier}: {e}")
         raise
+
+
+def get_active_bronze_properties(
+    source: SourcePortal | str, transaction: str, entity_type: str
+) -> list[ActiveListingRef]:
+    """
+    Retrieves active listings projected to lightweight ActiveListingRef dataclasses.
+    Bypasses domain entity deserialization to minimize memory footprint during reconciliation.
+    """
+    catalog = get_catalog()
+    table_identifier = _get_table_identifier(source)
+
+    try:
+        table = catalog.load_table(table_identifier)
+
+        # Select strictly required columns for state evaluation
+        df = (
+            pl.scan_iceberg(table)
+            .filter(
+                (pl.col("transaction_type") == transaction)
+                & (pl.col("entity_type") == entity_type)
+            )
+            .select(["source_id", "url", "scraped_at", "is_active"])
+            .collect()
+        )
+
+        if df.is_empty():
+            return []
+
+        # Deterministic state reconciliation: retain latest record per source_id
+        active_df = (
+            df.sort("scraped_at")
+            .unique(subset=["source_id"], keep="last")
+            .filter(pl.col("is_active") == True)
+            .select(["source_id", "url"])
+        )
+
+        # Direct row iteration avoids intermediate dictionary allocations
+        return [
+            ActiveListingRef(source_id=row[0], url=row[1])
+            for row in active_df.iter_rows()
+        ]
+
+    except NoSuchTableError, NoSuchNamespaceError:
+        return []
+    except Exception as e:
+        logger.error(f"Failed to fetch active records from {table_identifier}: {e}")
+        return []

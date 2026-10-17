@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
 from typing import Literal
@@ -222,11 +223,9 @@ class LandProperty(BaseProperty):
     transport: str | None = None
 
 
-class ActiveListingRef(BaseModel):
-    """Lightweight projection used strictly for reconciliation audits."""
+@dataclass(slots=True, frozen=True)
+class ActiveListingRef:
+    """Lightweight reference used strictly for HTTP reconciliation audits."""
 
-    id: str
     source_id: str
-    url: HttpUrl
-    transaction_type: TransactionType
-    entity_type: EntityType
+    url: str

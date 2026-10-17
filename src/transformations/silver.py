@@ -9,7 +9,7 @@ from pyiceberg.exceptions import (
 from pyiceberg.io.pyarrow import pyarrow_to_schema
 from pyiceberg.table import Table
 
-from src.contracts.base import SourcePortal
+from src.contracts.base import EntityType, SourcePortal
 from src.contracts.schemas import SILVER_PROPERTY_ARROW_SCHEMA
 from src.storage.catalog import get_catalog
 from src.transformations.enrichment import load_geo_lookup_df
@@ -58,6 +58,14 @@ def extract_and_enrich_location(df: pl.DataFrame) -> pl.DataFrame:
     geo_df = load_geo_lookup_df()
 
     if "postal_code" in df.columns and not geo_df.is_empty():
+        # Standardize postal code format to match lookup key
+        df = df.with_columns(
+            pl.col("postal_code")
+            .cast(pl.String)
+            .str.replace_all(r"\s+", "")
+            .alias("postal_code")
+        )
+
         df = df.join(geo_df, on="postal_code", how="left")
         df = df.with_columns(
             pl.coalesce(["region", "enriched_region"]).alias("region"),
@@ -98,16 +106,32 @@ def clean_legal_context(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def compute_derived_metrics(df: pl.DataFrame) -> pl.DataFrame:
-    """Computes analytical metrics like price per square meter."""
-    area_col = pl.coalesce(["usable_area_m2", "land_area_m2", "built_up_area_m2"])
+    """
+    Computes analytical metrics such as price per square meter.
+    Strictly partitions area calculation by entity type:
+    - LAND: strictly uses land_area_m2.
+    - BUILDINGS (apartment, house, commercial, other): uses usable_area_m2,
+      with built_up_area_m2 as a secondary fallback.
+    """
+    building_area = pl.coalesce(["usable_area_m2", "built_up_area_m2"])
 
-    df = df.with_columns(
-        pl.when((pl.col("price").is_not_null()) & (area_col > 0))
-        .then((pl.col("price") / area_col).round(2))
+    # Select appropriate area column based on physical nature of the property
+    target_area = (
+        pl.when(pl.col("entity_type") == EntityType.LAND.value)
+        .then(pl.col("land_area_m2"))
+        .otherwise(building_area)
+    )
+
+    return df.with_columns(
+        pl.when(
+            (pl.col("price").is_not_null())
+            & (target_area.is_not_null())
+            & (target_area > 0)
+        )
+        .then((pl.col("price") / target_area).round(2))
         .otherwise(None)
         .alias("price_per_m2")
     )
-    return df
 
 
 def process_silver(source: SourcePortal | str) -> Table | None:

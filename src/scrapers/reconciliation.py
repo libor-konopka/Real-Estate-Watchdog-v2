@@ -6,113 +6,107 @@ import aiohttp
 from loguru import logger
 
 from src.contracts.base import ActiveListingRef, SourcePortal
-from src.contracts.portals.base import AnyProperty
 
 
 class BazosReconciler:
     """
-    Audits the current existence of active listings on the Bazoš portal.
-    Generates tombstone entities for records that were removed or redirected.
+    Performs high-throughput, low-overhead HTTP verification of currently active listings.
+    Emits tombstone records for listings that have been deleted or expired on the source portal.
     """
 
-    _HEADERS: dict[str, str] = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-        "Connection": "keep-alive",
-    }
-
     def __init__(
-        self, session: aiohttp.ClientSession, concurrency_limit: int = 5
+        self,
+        session: aiohttp.ClientSession,
+        concurrency: int = 20,
+        request_timeout_seconds: int = 10,
     ) -> None:
         self.session = session
-        self._semaphore = asyncio.Semaphore(concurrency_limit)
+        self._semaphore = asyncio.Semaphore(concurrency)
+        self._timeout = aiohttp.ClientTimeout(total=request_timeout_seconds)
+        self._headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "cs,en-US;q=0.7,en;q=0.3",
+        }
 
     async def _check_listing_active(self, url: str) -> bool:
         """
-        Sends an HTTP HEAD/GET request without following redirects.
-        Returns False ONLY if the server returns explicit redirection or 404/410.
-        Returns True if status is 200 or in case of transient network errors.
+        Executes a lightweight HEAD request with redirect resolution.
+        Returns False if the resource is missing (404) or redirected away from the listing page.
         """
         async with self._semaphore:
             try:
-                # Try HEAD first to avoid downloading body payload
                 async with self.session.head(
-                    url, headers=self._HEADERS, allow_redirects=False
-                ) as response:
-                    # Method Not Allowed: fallback to GET
-                    if response.status == 405:
-                        async with self.session.get(
-                            url, headers=self._HEADERS, allow_redirects=False
-                        ) as get_response:
-                            status = get_response.status
-                    else:
-                        status = response.status
+                    url,
+                    headers=self._headers,
+                    allow_redirects=True,
+                    timeout=self._timeout,
+                ) as resp:
+                    if resp.status in (404, 410):
+                        return False
 
-                # Explicit signs of listing removal: redirects or not found
-                if status in (301, 302, 303, 307, 308, 404, 410):
-                    return False
+                    # Bazos redirects deleted/expired ads back to the parent category page
+                    normalized_original = url.rstrip("/")
+                    normalized_resolved = str(resp.url).rstrip("/")
+                    if normalized_resolved != normalized_original:
+                        return False
 
-                if status == 200:
-                    return True
+                    return resp.status == 200
 
-                # Rate limiting or WAF block: assume listing is STILL active to protect data integrity
+            except (TimeoutError, aiohttp.ClientError) as exc:
+                # Network flakiness should not trigger false deactivations
                 logger.warning(
-                    f"Unexpected status code {status} for {url}. "
-                    "Preserving active state to avoid data corruption."
+                    f"Transient network error probing listing {url}: {exc}. Preserving active state."
                 )
                 return True
-
-            except (TimeoutError, aiohttp.ClientError) as e:
-                logger.debug(f"Network error verifying {url}: {e}. Retaining status.")
+            except Exception as exc:
+                logger.error(f"Unexpected error probing listing {url}: {exc}")
                 return True
-            except Exception as e:
-                logger.error(f"Unexpected error checking {url}: {e}")
-                return True
-
-    async def _audit_single_record(self, record: AnyProperty) -> AnyProperty | None:
-        """Audits a single property and returns a tombstone if it was removed."""
-        is_active = await self._check_listing_active(str(record.url))
-        if not is_active:
-            logger.debug(f"Listing {record.source_id} removed from portal.")
-            return record.model_copy(
-                update={
-                    "is_active": False,
-                    "scraped_at": datetime.now(ZoneInfo("UTC")),
-                }
-            )
-        return None
 
     async def verify_and_deactivate(
-        self, active_records: list[ActiveListingRef]
+        self,
+        active_records: list[ActiveListingRef],
+        transaction: str,
+        entity_type: str,
     ) -> list[dict]:
         """
-        Concurrently checks active records and returns tombstone dictionaries
-        ready for Bronze append.
+        Concurrently checks existing active listings.
+        Returns minimal tombstone payloads ready for direct ingestion via save_to_iceberg.
         """
         if not active_records:
             return []
 
-        async def audit(record: ActiveListingRef) -> dict | None:
-            is_active = await self._check_listing_active(str(record.url))
+        logger.info(
+            f"Starting reconciliation audit for {len(active_records)} active listings "
+            f"({transaction}/{entity_type})..."
+        )
+
+        async def probe(ref: ActiveListingRef) -> dict | None:
+            is_active = await self._check_listing_active(ref.url)
             if not is_active:
-                logger.debug(f"Listing {record.source_id} removed from portal.")
+                logger.info(f"Listing deemed inactive on source: {ref.source_id}")
                 return {
-                    "id": record.id,
+                    "id": f"{SourcePortal.BAZOS.value}_{ref.source_id}",
                     "title": "[DEACTIVATED]",
                     "is_active": False,
-                    "source_id": record.source_id,
-                    "url": str(record.url),
+                    "source_id": ref.source_id,
+                    "url": ref.url,
                     "source": SourcePortal.BAZOS.value,
-                    "transaction_type": record.transaction_type.value,
-                    "entity_type": record.entity_type.value,
+                    "transaction_type": transaction,
+                    "entity_type": entity_type,
                     "scraped_at": datetime.now(ZoneInfo("UTC")),
                 }
             return None
 
-        tasks = [audit(rec) for rec in active_records]
+        tasks = [probe(ref) for ref in active_records]
         results = await asyncio.gather(*tasks)
 
-        return [res for res in results if res is not None]
+        tombstones = [res for res in results if res is not None]
+        logger.info(
+            f"Reconciliation completed: {len(tombstones)} inactive listings marked for deactivation."
+        )
+        return tombstones

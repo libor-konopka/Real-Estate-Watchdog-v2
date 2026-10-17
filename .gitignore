@@ -12,6 +12,7 @@ __pycache__/
 # --- Secrets and identities (Environment variables) ---
 .env
 .env.*
+!.env.example
 *.pem
 
 # --- Physical storage and volumes (Docker, Lakehouse, Data) ---
