@@ -1,17 +1,28 @@
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, HttpUrl
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    PlainSerializer,
+    TypeAdapter,
+)
+
+# Custom type: forces conversion of pydantic_core.Url to str during any model_dump()
+# Prevents PyArrow/Polars from encountering unknown Python Url objects
+SerializableHttpUrl = Annotated[
+    HttpUrl,
+    PlainSerializer(str, return_type=str, when_used="always"),
+]
 
 
 class SourcePortal(StrEnum):
-    """
-    Defines the allowed source portals for data extraction.
-    Values are strictly lowercase ASCII to ensure frictionless
-    integration with data lakes, Parquet files, and Polars.
-    """
+    """Allowed source real estate portals."""
 
     SREALITY = "sreality"
     IDNES = "idnes"
@@ -20,7 +31,7 @@ class SourcePortal(StrEnum):
 
 
 class TransactionType(StrEnum):
-    """Defines the nature of the financial transfer."""
+    """Transaction category."""
 
     SALE = "sale"
     RENT = "rent"
@@ -28,7 +39,7 @@ class TransactionType(StrEnum):
 
 
 class EntityType(StrEnum):
-    """Defines the physical nature of the space."""
+    """Property spatial archetype."""
 
     APARTMENT = "apartment"
     HOUSE = "house"
@@ -38,7 +49,7 @@ class EntityType(StrEnum):
 
 
 class Currency(StrEnum):
-    """Defines the accepted fiat currency."""
+    """Supported fiat currencies."""
 
     CZK = "czk"
     EUR = "eur"
@@ -46,21 +57,14 @@ class Currency(StrEnum):
 
 
 class GPSCoordinates(BaseModel):
-    """
-    Exact spatial point defined by latitude and longitude.
-    These axes form an inseparable duality; both must be present to anchor the entity in reality.
-    """
+    """Exact spatial point anchored by latitude and longitude."""
 
     lat: float
     lon: float
 
 
 class Location(BaseModel):
-    """
-    Macro-space representation including administrative divisions.
-    Embraces the void by allowing the exact spatial anchor (gps) to be absent
-    without breaking the internal integrity of the system.
-    """
+    """Administrative area context and optional spatial coordinate."""
 
     region: str | None = None
     district: str | None = None
@@ -91,11 +95,7 @@ class HeatingType(StrEnum):
 
 
 class Infrastructure(BaseModel):
-    """
-    Represents the energy and material flows connected to the property.
-    Embraces the reality of off-grid environments and permaculture systems
-    where external dependencies may be entirely absent or unlisted.
-    """
+    """Utilities and infrastructure connections."""
 
     water: WaterType | None = None
     electricity: bool | None = None
@@ -111,12 +111,7 @@ class OwnershipType(StrEnum):
 
 
 class LegalContext(BaseModel):
-    """
-    Anchors the property within the legal and social framework of human society.
-    Captures the form of ownership and the underlying financial energy often
-    hidden in price notes (e.g., commissions or VAT). Embraces the void of
-    missing information by making all fields optional.
-    """
+    """Legal metadata and encumbrances."""
 
     ownership: OwnershipType | None = None
     price_note: str | None = None
@@ -152,13 +147,8 @@ class EnergyClass(StrEnum):
 
 
 class BaseProperty(BaseModel):
-    """
-    The absolute core of the data contract.
-    Unifies identity, space, energy, and time into a single, immutable entity.
-    Acts as an impenetrable shield against external data chaos.
-    """
+    """Core domain contract immutable across all property types."""
 
-    # Model
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     # Identity
@@ -166,35 +156,33 @@ class BaseProperty(BaseModel):
     title: str
     is_active: bool
     source_id: str
-    url: HttpUrl
+    url: SerializableHttpUrl
 
     # Categorization
     source: SourcePortal
     transaction_type: TransactionType
     entity_type: EntityType
 
-    # Financial energy
+    # Financial details
     price: float | None = None
     currency: Currency | None = None
 
-    # Time anchor (requires timezone-aware object)
+    # Time anchor (requires timezone-aware timestamp)
     scraped_at: AwareDatetime
 
-    # Internal composition
+    # Nested structures
     location: Location
     infrastructure: Infrastructure | None = None
     legal: LegalContext | None = None
 
+    # Dimensions
     land_area_m2: float | None = None
     usable_area_m2: float | None = None
     description: str | None = None
 
 
 class BuildingProperty(BaseProperty):
-    """
-    Physical manifestation of a structure anchored in space.
-    Inherits the universal core and adds structural attributes.
-    """
+    """Structural property contract (apartments, houses, offices)."""
 
     entity_type: Literal[
         EntityType.APARTMENT,
@@ -210,10 +198,7 @@ class BuildingProperty(BaseProperty):
 
 
 class LandProperty(BaseProperty):
-    """
-    Raw, unformed earth energy representing the landscape.
-    Inherits the universal core and adds terrain characteristics.
-    """
+    """Raw land property contract."""
 
     entity_type: Literal[EntityType.LAND]
 
@@ -221,6 +206,19 @@ class LandProperty(BaseProperty):
     location_character: str | None = None
     access_road: str | None = None
     transport: str | None = None
+
+
+# Polymorphic Discriminated Union representing any valid listing
+PropertyListing = Annotated[
+    BuildingProperty | LandProperty,
+    Field(discriminator="entity_type"),
+]
+
+# High-performance TypeAdapter for validating single records or batches
+property_listing_adapter: TypeAdapter[PropertyListing] = TypeAdapter(PropertyListing)
+property_listing_list_adapter: TypeAdapter[list[PropertyListing]] = TypeAdapter(
+    list[PropertyListing]
+)
 
 
 @dataclass(slots=True, frozen=True)

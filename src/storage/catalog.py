@@ -1,4 +1,3 @@
-import os
 from functools import lru_cache
 
 from pyiceberg.catalog import Catalog, load_catalog
@@ -6,37 +5,26 @@ from pyiceberg.catalog import Catalog, load_catalog
 from src.config import get_storage_settings
 
 
-def set_storage_env() -> None:
-    """
-    Propagates validated settings to os.environ for lower-level S3/fsspec libraries.
-    """
-    settings = get_storage_settings()
-    env_mappings = {
-        "AWS_ACCESS_KEY_ID": settings.aws_access_key_id,
-        "AWS_SECRET_ACCESS_KEY": settings.aws_secret_access_key,
-        "AWS_ENDPOINT_URL": settings.aws_endpoint_url,
-        "AWS_ALLOW_HTTP": settings.aws_allow_http,
-        "AWS_REGION": settings.aws_region,
-    }
-    for key, value in env_mappings.items():
-        os.environ[key] = value
-
-
 @lru_cache(maxsize=1)
 def get_catalog() -> Catalog:
+    """Initializes and returns a singleton Iceberg REST catalog client.
+
+    Uses PyArrowFileIO for zero-copy Parquet read/write operations against
+    MinIO object storage, bypassing global os.environ side-effects.
     """
-    Returns a singleton RestCatalog instance connected to Nessie and MinIO.
-    All endpoints and authentication are injected from validated configuration.
-    """
-    set_storage_env()
     settings = get_storage_settings()
 
-    return load_catalog(
-        "default",
-        **{
-            "type": "rest",
-            "uri": settings.iceberg_catalog_uri,
-            "s3.endpoint": settings.iceberg_s3_endpoint,
-            "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
-        },
-    )
+    catalog_properties = {
+        "type": "rest",
+        "uri": settings.iceberg_catalog_uri,
+        "warehouse": settings.iceberg_warehouse,
+        # Native PyArrow FileIO configuration
+        "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
+        "s3.endpoint": settings.aws_endpoint_url,
+        "s3.access-key-id": settings.aws_access_key_id,
+        "s3.secret-access-key": settings.aws_secret_access_key.get_secret_value(),
+        "s3.region": settings.aws_region,
+        "s3.path-style-access": ("true" if settings.s3_path_style_access else "false"),
+    }
+
+    return load_catalog("default", **catalog_properties)

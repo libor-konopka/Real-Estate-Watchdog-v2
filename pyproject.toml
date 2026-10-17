@@ -28,4 +28,4 @@ dev = [
 unfixable = ["F401"]
 
 [tool.dagster]
-module_name = "src.orchestration.definitions"
+module_name = "src.orchestration.assets.definitions"
