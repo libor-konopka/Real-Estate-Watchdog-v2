@@ -1,230 +1,238 @@
 import asyncio
-import re
 from collections.abc import AsyncGenerator
+from typing import Any
 
 import aiohttp
 from loguru import logger
-from selectolax.parser import HTMLParser
 
-from src.contracts.portals.base import AnyProperty
-from src.contracts.portals.bazos import BazosInputModel
-from src.scrapers.bazos_parser import BazosDOMParser
+from src.contracts.base import BuildingProperty, LandProperty
+from src.contracts.portals.bezrealitky import BezrealitkyRawInput
+from src.scrapers.bezrealitky_parser import BezrealitkyParser
 
 
-class BazosScraper:
+class BezrealitkyScraper:
+    """Orchestrator for the Bezrealitky portal using GraphQL API.
+
+    Handles pagination via limit/offset, payload validation, incremental
+    filtering against known Bronze records, and domain entity generation.
     """
-    Orchestrator for the Bazoš portal.
-    Manages asynchronous HTTP requests, pagination, and domain entity extraction.
-    """
+
+    GRAPHQL_ENDPOINT: str = "https://api.bezrealitky.cz/graphql"
 
     _HEADERS: dict[str, str] = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            "WebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "cs,en;q=0.9",
-        "Connection": "keep-alive",
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Origin": "https://www.bezrealitky.cz",
+        "Referer": "https://www.bezrealitky.cz/",
     }
 
+    # Declarative GraphQL query requesting exact fields needed for Bronze layer
+    GRAPHQL_QUERY: str = """
+    query GetListEstates(
+        $offerType: [OfferType!],
+        $estateType: [EstateType!],
+        $limit: Int,
+        $offset: Int
+    ) {
+        listEstates(
+            offerType: $offerType,
+            estateType: $estateType,
+            limit: $limit,
+            offset: $offset
+        ) {
+            items {
+                id
+                uri
+                name
+                offerType
+                estateType
+                price
+                currency
+                gps {
+                    lat
+                    lng
+                }
+                address {
+                    city
+                    zip
+                    region
+                    district
+                }
+                surface
+                surfaceLand
+                availableFrom
+                tags
+                condition
+                construction
+                ownership
+                penb
+                description
+            }
+            pageInfo {
+                hasNextPage
+            }
+        }
+    }
+    """
+
     def __init__(
-        self, session: aiohttp.ClientSession, concurrency_limit: int = 3
+        self,
+        session: aiohttp.ClientSession,
+        concurrency_limit: int = 2,
+        request_delay: float = 0.5,
     ) -> None:
         self.session = session
-        self.base_url = "https://reality.bazos.cz"
         self._semaphore = asyncio.Semaphore(concurrency_limit)
-
-    async def _process_detail(
-        self,
-        entity_url: str,
-        raw_transaction: str,
-        raw_entity: str,
-        max_retries: int = 3,
-    ) -> AnyProperty | None:
-        """
-        Fetches an individual listing page, parses DOM via selectolax,
-        and returns a materialized domain property.
-        """
-        async with self._semaphore:
-            for attempt in range(1, max_retries + 1):
-                try:
-                    async with self.session.get(
-                        entity_url, headers=self._HEADERS
-                    ) as response:
-                        if response.status != 200:
-                            logger.warning(
-                                f"Failed to fetch detail (status {response.status}): {entity_url}"
-                            )
-                            return None
-
-                        html_content = await response.text(encoding="utf-8")
-
-                    parser = BazosDOMParser(html_content, entity_url)
-
-                    title = parser.extract_title()
-                    description = parser.extract_description()
-                    price, currency = parser.extract_price()
-                    location, postal_code = parser.extract_location()
-
-                    combined_text = f"{title} {description}"
-
-                    input_model = BazosInputModel(
-                        url=entity_url,
-                        raw_transaction=raw_transaction,
-                        raw_entity=raw_entity,
-                        title=title,
-                        description=description,
-                        price=price,
-                        currency=currency,
-                        location=location,
-                        postal_code=postal_code,
-                        infrastructure=parser.extract_infrastructure(description),
-                        legal=parser.extract_legal_context(description, title),
-                        usable_area_m2=parser.extract_usable_area(title, description),
-                        land_area_m2=parser.extract_land_area(title, description),
-                        built_up_area_m2=parser.extract_built_up_area(
-                            title, description
-                        ),
-                        material=parser.extract_material(combined_text),
-                        condition=parser.extract_condition(combined_text),
-                        energy_class=parser.extract_energy_class(combined_text),
-                    )
-
-                    return input_model.materialize()
-
-                except (TimeoutError, aiohttp.ClientError) as e:
-                    if attempt == max_retries:
-                        logger.error(f"Exceeded max retries for {entity_url}: {e}")
-                        return None
-
-                    wait_seconds = 2 * attempt
-                    logger.debug(
-                        f"Network issue on {entity_url}. Backoff {wait_seconds}s "
-                        f"(attempt {attempt}/{max_retries})."
-                    )
-                    await asyncio.sleep(wait_seconds)
-
-                except Exception as e:
-                    logger.error(
-                        f"Unrecoverable parsing/validation error for {entity_url}: {e}"
-                    )
-                    return None
-
-            return None
+        self._request_delay = request_delay
 
     async def scrape_section(
         self,
-        raw_transaction: str,
-        raw_entity: str,
-        known_data: dict[str, str] | None = None,
-    ) -> AsyncGenerator[AnyProperty]:
+        transaction: str,
+        entity: str,
+        known_data: dict[str, float | None] | None = None,
+        limit_per_page: int = 50,
+        max_pages: int = 30,
+        max_consecutive_known: int = 2,
+    ) -> AsyncGenerator[BuildingProperty | LandProperty]:
+        """Asynchronously pages through GraphQL results, yielding new or updated listings.
+
+        Halts pagination early when encountering consecutive pages of already known data.
         """
-        Iterates through paginated listing views.
-        Skips already known records with unchanged prices and yields materialized entities.
-        """
-        known_data = known_data or {}
-        offset = 0
+        known_records = known_data or {}
+
+        # Resolve internal keys to GraphQL API enums
+        api_offer_type = BezrealitkyRawInput.API_TRANSACTION_MAP.get(transaction)
+        api_estate_type = BezrealitkyRawInput.API_ENTITY_MAP.get(entity)
+
+        if not api_offer_type or not api_estate_type:
+            logger.error(
+                f"Unsupported category parameters: transaction='{transaction}', entity='{entity}'"
+            )
+            return
+
         consecutive_known_pages = 0
 
-        while True:
-            current_url = f"{self.base_url}/{raw_transaction}/{raw_entity}/"
-            if offset > 0:
-                current_url += f"{offset}/"
+        for page in range(max_pages):
+            offset = page * limit_per_page
 
-            try:
-                async with self.session.get(
-                    current_url, headers=self._HEADERS
-                ) as response:
-                    if response.status != 200:
-                        logger.info(
-                            f"Section boundary reached at {current_url} (status {response.status})."
-                        )
-                        break
+            payload = {
+                "query": self.GRAPHQL_QUERY,
+                "variables": {
+                    "offerType": [api_offer_type],
+                    "estateType": [api_estate_type],
+                    "limit": limit_per_page,
+                    "offset": offset,
+                },
+            }
 
-                    list_html = await response.text(encoding="utf-8")
+            response_data = await self._fetch_graphql_page(payload)
+            if not response_data:
+                logger.info(
+                    f"No response or error reached for {transaction}/{entity} at offset {offset}."
+                )
+                break
 
-                tree = HTMLParser(list_html)
-                listings = tree.css("div.inzeraty")
+            items, has_next_page = self._extract_items_and_page_info(response_data)
+            if not items:
+                logger.info(
+                    f"No more items returned for {transaction}/{entity} on page {page + 1}."
+                )
+                break
 
-                if not listings:
+            # Fast-path incremental check
+            items_to_process: list[dict[str, Any]] = []
+            for item in items:
+                source_id = str(item.get("id", ""))
+                current_price = (
+                    float(item["price"]) if item.get("price") is not None else None
+                )
+
+                if source_id in known_records:
+                    previous_price = known_records[source_id]
+                    if current_price == previous_price:
+                        continue
+
+                items_to_process.append(item)
+
+            logger.debug(
+                f"Page {page + 1} ({transaction}/{entity}): {len(items_to_process)}/{len(items)} "
+                "listings are new or updated."
+            )
+
+            # Early stopping check
+            if not items_to_process:
+                consecutive_known_pages += 1
+                if consecutive_known_pages >= max_consecutive_known:
                     logger.info(
-                        f"No listings found at {current_url}. Ending pagination."
+                        f"Early stopping triggered for {transaction}/{entity} "
+                        f"after {consecutive_known_pages} consecutive known pages."
                     )
                     break
-
-                new_detail_urls: list[str] = []
-
-                for container in listings:
-                    h2_node = container.css_first("h2.nadpis")
-                    if not h2_node:
-                        continue
-
-                    a_tag = h2_node.css_first("a")
-                    if not a_tag or "href" not in a_tag.attributes:
-                        continue
-
-                    detail_path = str(a_tag.attributes["href"])
-                    match = re.search(r"/inzerat/(\d+)/", detail_path)
-                    if not match:
-                        continue
-
-                    source_id = match.group(1)
-                    price_node = container.css_first("div.inzeratycena")
-                    current_price = (
-                        re.sub(r"[^\d]", "", price_node.text(strip=True))
-                        if price_node
-                        else ""
-                    )
-
-                    # Incremental skipping: identical price on known ID
-                    if source_id in known_data:
-                        historical_price = re.sub(
-                            r"[^\d]", "", str(known_data[source_id] or "")
-                        )
-                        if current_price == historical_price:
-                            continue
-                        logger.debug(
-                            f"Price change detected on ID {source_id}: "
-                            f"{historical_price} -> {current_price}"
-                        )
-
-                    full_url = (
-                        f"{self.base_url}{detail_path}"
-                        if detail_path.startswith("/")
-                        else f"{self.base_url}/{detail_path}"
-                    )
-                    new_detail_urls.append(full_url)
-
-                if not new_detail_urls:
-                    consecutive_known_pages += 1
-                    if consecutive_known_pages >= 3:
-                        logger.info(
-                            "Stop condition met: 3 consecutive pages contained "
-                            "only unchanged known listings."
-                        )
-                        break
-
-                    offset += 20
-                    continue
-
+            else:
                 consecutive_known_pages = 0
 
-                tasks = [
-                    self._process_detail(url, raw_transaction, raw_entity)
-                    for url in new_detail_urls
-                ]
-                results = await asyncio.gather(*tasks)
+                for raw_item in items_to_process:
+                    property_entity = BezrealitkyParser.parse_advert(raw_item)
+                    if property_entity is not None:
+                        yield property_entity
 
-                for entity in results:
-                    if entity is not None:
-                        yield entity
-
-                offset += 20
-
-            except (TimeoutError, aiohttp.ClientError) as e:
-                logger.warning(f"Connection failure on {current_url}: {e}")
-                await asyncio.sleep(5.0)
+            if not has_next_page:
+                logger.info(f"Reached last available page for {transaction}/{entity}.")
                 break
-            except Exception as e:
-                logger.error(f"Unexpected fault while scraping {current_url}: {e}")
-                break
+
+            await asyncio.sleep(self._request_delay)
+
+    async def _fetch_graphql_page(
+        self,
+        payload: dict[str, Any],
+        max_retries: int = 3,
+    ) -> dict[str, Any] | None:
+        """Executes a single GraphQL query with retries and exponential backoff."""
+        async with self._semaphore:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    async with self.session.post(
+                        self.GRAPHQL_ENDPOINT,
+                        json=payload,
+                        headers=self._HEADERS,
+                    ) as response:
+                        if response.status != 200:
+                            logger.warning(
+                                f"GraphQL query failed (status {response.status}), "
+                                f"attempt {attempt}/{max_retries}"
+                            )
+                            if attempt == max_retries:
+                                return None
+                            await asyncio.sleep(2 * attempt)
+                            continue
+
+                        data: dict[str, Any] = await response.json()
+                        if "errors" in data:
+                            logger.error(f"GraphQL returned errors: {data['errors']}")
+                            return None
+
+                        return data
+
+                except (TimeoutError, aiohttp.ClientError) as e:
+                    if attempt == max_retries:
+                        logger.error(f"Network error querying GraphQL: {e}")
+                        return None
+                    await asyncio.sleep(2 * attempt)
+
+            return None
+
+    @staticmethod
+    def _extract_items_and_page_info(
+        data: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Safely extracts items array and pagination boundary flag."""
+        estates = data.get("data", {}).get("listEstates", {})
+        items = estates.get("items") or []
+        page_info = estates.get("pageInfo") or {}
+        has_next_page = bool(page_info.get("hasNextPage", False))
+        return items, has_next_page
