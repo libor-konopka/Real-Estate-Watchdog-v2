@@ -1,3 +1,8 @@
+import uuid
+from collections.abc import Sequence
+from datetime import UTC, datetime, timezone
+from typing import Any
+
 import polars as pl
 import pyarrow as pa
 from loguru import logger
@@ -8,9 +13,8 @@ from pyiceberg.exceptions import (
 )
 from pyiceberg.io.pyarrow import pyarrow_to_schema
 
-from src.contracts.base import ActiveListingRef, SourcePortal
-from src.contracts.portals.base import AnyProperty
-from src.contracts.schemas import PROPERTY_ARROW_SCHEMA
+from src.contracts.base import ActiveListingRef, PropertyListing, SourcePortal
+from src.contracts.schemas import BRONZE_PROPERTY_ARROW_SCHEMA
 from src.storage.catalog import get_catalog
 
 NAMESPACE = "bronze"
@@ -25,26 +29,31 @@ def _get_table_identifier(source: SourcePortal | str) -> str:
 def get_known_source_ids(
     source: SourcePortal | str, transaction: str, entity_type: str
 ) -> dict[str, float | None]:
-    """
-    Loads existing Bronze Iceberg table and returns a mapping of source_id -> price.
-    Used for incremental scraping to detect price changes or skip existing listings.
+    """Loads existing Bronze Iceberg table and returns a mapping of source_id -> price.
+
+    Ensures deterministic results by taking the most recent price per source_id.
     """
     catalog = get_catalog()
     table_identifier = _get_table_identifier(source)
 
     try:
         table = catalog.load_table(table_identifier)
+        # Scan Iceberg, sort chronologically, and retain strictly the latest record
         df = (
             pl.scan_iceberg(table)
             .filter(
                 (pl.col("transaction_type") == transaction)
                 & (pl.col("entity_type") == entity_type)
             )
+            .sort("scraped_at")
+            .unique(subset=["source_id"], keep="last")
             .select(["source_id", "price"])
             .collect()
         )
-        return dict(zip(df["source_id"].to_list(), df["price"].to_list()))
+        return dict(zip(df["source_id"].to_list(), df["price"].to_list(), strict=False))
+
     except NoSuchTableError, NoSuchNamespaceError:
+        # Table or namespace does not exist yet upon initial run
         return {}
     except Exception as e:
         logger.error(f"Failed to read known IDs from {table_identifier}: {e}")
@@ -52,12 +61,14 @@ def get_known_source_ids(
 
 
 def save_to_iceberg(
-    entities: list[AnyProperty | dict], source: SourcePortal | str
+    entities: Sequence[PropertyListing | dict[str, Any]],
+    source: SourcePortal | str,
+    batch_id: str | None = None,
 ) -> None:
-    """
-    Directly materializes domain entities or tombstone dicts into an Arrow Table
-    matching PROPERTY_ARROW_SCHEMA and appends to the Bronze Iceberg table.
-    Bypasses Polars DataFrame creation to prevent struct casting errors on null values.
+    """Materializes domain entities or tombstone dicts into an Arrow Table.
+
+    Accepts any covariant Sequence (list, tuple) of domain listings or raw dictionaries,
+    applies Lakehouse audit metadata, and appends to the Bronze Iceberg table.
     """
     if not entities:
         return
@@ -65,14 +76,19 @@ def save_to_iceberg(
     catalog = get_catalog()
     table_identifier = _get_table_identifier(source)
 
-    records: list[dict] = []
+    effective_batch_id = batch_id or uuid.uuid4().hex
+    ingested_at_utc = datetime.now(UTC)
+
+    records: list[dict[str, Any]] = []
     for item in entities:
         if isinstance(item, dict):
-            row = item
+            row = item.copy()
         else:
             row = item.model_dump(mode="python")
 
-        # Normalize non-Arrow serializable types
+        row["batch_id"] = effective_batch_id
+        row["ingested_at"] = ingested_at_utc
+
         if "url" in row and row["url"] is not None:
             row["url"] = str(row["url"])
         if "price" in row and row["price"] is not None:
@@ -80,8 +96,7 @@ def save_to_iceberg(
 
         records.append(row)
 
-    # Directly build Arrow Table with enforced schema; handles missing nested fields cleanly
-    arrow_table = pa.Table.from_pylist(records, schema=PROPERTY_ARROW_SCHEMA)
+    arrow_table = pa.Table.from_pylist(records, schema=BRONZE_PROPERTY_ARROW_SCHEMA)
 
     try:
         try:
@@ -94,12 +109,12 @@ def save_to_iceberg(
         except NoSuchTableError:
             table = catalog.create_table(
                 identifier=table_identifier,
-                schema=pyarrow_to_schema(PROPERTY_ARROW_SCHEMA),
+                schema=pyarrow_to_schema(BRONZE_PROPERTY_ARROW_SCHEMA),
             )
 
         table.append(arrow_table)
         logger.info(
-            f"Bronze layer appended to {table_identifier} (Records: {len(entities)})"
+            f"Bronze layer appended to {table_identifier} (Records: {len(entities)}, Batch: {effective_batch_id})"
         )
     except Exception as e:
         logger.error(f"Failed to append records to {table_identifier}: {e}")
@@ -109,9 +124,9 @@ def save_to_iceberg(
 def get_active_bronze_properties(
     source: SourcePortal | str, transaction: str, entity_type: str
 ) -> list[ActiveListingRef]:
-    """
-    Retrieves active listings projected to lightweight ActiveListingRef dataclasses.
-    Bypasses domain entity deserialization to minimize memory footprint during reconciliation.
+    """Retrieves active listings projected to lightweight ActiveListingRef dataclasses.
+
+    Evaluates the latest lifecycle state per source_id to identify currently active listings.
     """
     catalog = get_catalog()
     table_identifier = _get_table_identifier(source)
@@ -119,7 +134,7 @@ def get_active_bronze_properties(
     try:
         table = catalog.load_table(table_identifier)
 
-        # Select strictly required columns for state evaluation
+        # Select strictly required columns for lifecycle state evaluation
         df = (
             pl.scan_iceberg(table)
             .filter(
@@ -133,11 +148,11 @@ def get_active_bronze_properties(
         if df.is_empty():
             return []
 
-        # Deterministic state reconciliation: retain latest record per source_id
+        # Deduplicate to find the latest known state of each property
         active_df = (
             df.sort("scraped_at")
             .unique(subset=["source_id"], keep="last")
-            .filter(pl.col("is_active") == True)
+            .filter(pl.col("is_active"))
             .select(["source_id", "url"])
         )
 

@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -20,14 +21,67 @@ from src.contracts.portals import bazos_patterns as patterns
 from src.contracts.validators import sanitize_czech_price
 
 
+@dataclass(slots=True, frozen=True)
+class BazosListingCard:
+    """Lightweight projection of an advertisement card on a catalog page."""
+
+    source_id: str
+    url: str
+    price: float | None
+
+
 class BazosDOMParser:
-    """High-performance parser for Bazos listing detail pages using selectolax."""
+    """High-performance parser for Bazos listing pages using selectolax."""
 
     def __init__(self, html_content: str, url: str) -> None:
         self.tree = HTMLParser(html_content)
         self.url = url
         self._table_data: dict[str, str] = {}
         self._extract_table_rows()
+
+    @staticmethod
+    def parse_catalog_page(
+        html_content: str, base_url: str = "https://reality.bazos.cz"
+    ) -> list[BazosListingCard]:
+        """Extracts listing cards from a pagination catalog page in a single pass."""
+        tree = HTMLParser(html_content)
+        cards: list[BazosListingCard] = []
+
+        # Iterate over all listing containers in the search result
+        for container in tree.css("div.inzeraty"):
+            link_node = container.css_first("h2.nadpis a, span.nadpis a")
+            if not link_node:
+                continue
+
+            href = link_node.attributes.get("href")
+            if not href:
+                continue
+
+            full_url = (
+                href if href.startswith("http") else f"{base_url.rstrip('/')}{href}"
+            )
+
+            # Extract source_id: /inzerat/19837261/prodej-bytu.php -> 19837261
+            match = re.search(r"/inzerat/(\d+)/", full_url) or re.search(
+                r"/(\d+)/", full_url
+            )
+            if not match:
+                continue
+            source_id = match.group(1)
+
+            # Extract card price to allow fast-path skipping without detail fetching
+            price_val: float | None = None
+            if price_node := container.css_first("div.inzeratycena"):
+                raw_price = price_node.text(strip=True)
+                dec_price, _ = sanitize_czech_price(raw_price)
+                if dec_price is not None:
+                    price_val = float(dec_price)
+
+            cards.append(
+                BazosListingCard(source_id=source_id, url=full_url, price=price_val)
+            )
+
+        return cards
 
     def _extract_table_rows(self) -> None:
         """Parses detail table into key-value map in a single pass."""
@@ -51,12 +105,16 @@ class BazosDOMParser:
     def extract_price(self) -> tuple[float | None, str]:
         raw_price = self._table_data.get("cena", "")
         dec_price, currency = sanitize_czech_price(raw_price)
-        return (float(dec_price) if dec_price is not None else None, currency.value)
+        return (
+            float(dec_price) if dec_price is not None else None,
+            currency.value,
+        )
 
-    def extract_location(self) -> tuple[Location, str | None]:
+    def extract_location(self) -> Location:
+        """Extracts location and correctly sets postal_code within the domain model."""
         raw_loc = self._table_data.get("lokalita", "").replace("\xa0", " ").strip()
-        postal_code = None
-        municipality = raw_loc
+        postal_code: str | None = None
+        municipality: str | None = raw_loc
 
         if match := patterns.RE_LOCATION.match(raw_loc):
             if match.group(1):
@@ -64,8 +122,12 @@ class BazosDOMParser:
             if match.group(2):
                 municipality = match.group(2).strip()
 
-        location = Location(region=None, district=None, municipality=municipality)
-        return location, postal_code
+        return Location(
+            region=None,
+            district=None,
+            municipality=municipality,
+            postal_code=postal_code,
+        )
 
     def extract_infrastructure(self, desc: str) -> Infrastructure:
         infra = Infrastructure()
