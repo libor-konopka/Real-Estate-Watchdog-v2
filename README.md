@@ -1,5 +1,10 @@
 # Real-Estate Watchdog v2
 
+[![CI](https://github.com/libor-konopka/Real-Estate-Watchdog-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/libor-konopka/Real-Estate-Watchdog-v2/actions/workflows/ci.yml)
+![Python 3.14](https://img.shields.io/badge/python-3.14-blue.svg)
+![Apache Iceberg](https://img.shields.io/badge/Apache%20Iceberg-Lakehouse-0073e6.svg)
+![Polars](https://img.shields.io/badge/Polars-DataFrames-cd792c.svg)
+
 Asynchronous **Medallion Data Lakehouse** pipeline for monitoring, normalizing, deduplicating, and analyzing Czech real estate listings across multiple portals (**Bazoš** and **Bezrealitky**).
 
 Built with **Python 3.14**, **Apache Iceberg**, **Project Nessie**, **MinIO**, **Polars**, **Pydantic v2**, **Dagster**, and **Streamlit**.
@@ -57,6 +62,14 @@ Built with **Python 3.14**, **Apache Iceberg**, **Project Nessie**, **MinIO**, *
 * **Open Table Format & Git-like Catalog:** Persists versioned Parquet datasets on S3-compatible **MinIO** managed by **Project Nessie** REST Catalog.
 
 ---
+
+## Screenshots
+
+### Orchestration & Asset Lineage (Dagster UI)
+![Dagster Asset Lineage](docs/images/dagster-lineage.png)
+
+### Analytical Lakehouse Explorer (Streamlit)
+![Streamlit Dashboard](docs/images/streamlit-dashboard.png)
 
 ## Project Structure
 
