@@ -204,9 +204,11 @@ class BazosDOMParser:
                 else:
                     try:
                         clean_date = re.sub(r"\s+", "", val)
-                        legal.available_from = datetime.strptime(
-                            clean_date, "%d.%m.%Y"
-                        ).date()
+                        legal.available_from = (
+                            datetime.strptime(clean_date, "%d.%m.%Y")
+                            .replace(tzinfo=ZoneInfo("Europe/Prague"))
+                            .date()
+                        )
                     except ValueError:
                         pass
                 break

@@ -95,8 +95,9 @@ BRONZE_PROPERTY_ARROW_SCHEMA = pa.schema(
 # -----------------------------------------------------------------------------
 SILVER_PROPERTY_ARROW_SCHEMA = pa.schema(
     [
-        # Identity
+        # Identity & Entity Resolution
         pa.field("id", pa.string(), nullable=False),
+        pa.field("canonical_property_id", pa.string(), nullable=False),
         pa.field("title", pa.string(), nullable=False),
         pa.field("is_active", pa.bool_(), nullable=False),
         pa.field("source_id", pa.string(), nullable=False),

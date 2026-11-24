@@ -1,7 +1,6 @@
 import hashlib
 import re
-from datetime import UTC, datetime, timezone
-from decimal import Decimal
+from datetime import UTC, datetime
 from typing import ClassVar
 
 from pydantic import HttpUrl
@@ -101,7 +100,6 @@ class BazosInputModel(BasePortalInput):
         )
         entity_enum = self._ENTITY_MAP.get(self.raw_entity, EntityType.APARTMENT)
 
-        dec_price = Decimal(str(self.price)) if self.price is not None else None
         currency_enum = (
             Currency(self.currency.lower())
             if self.currency.lower() in Currency
@@ -113,33 +111,47 @@ class BazosInputModel(BasePortalInput):
         if self.postal_code and not loc.postal_code:
             loc = loc.model_copy(update={"postal_code": self.postal_code})
 
-        base_params = {
-            "id": entity_id,
-            "title": self.title or "Bazoš inzerát",
-            "is_active": True,
-            "source_id": source_id,
-            "url": HttpUrl(self.url),
-            "source": SourcePortal.BAZOS,
-            "transaction_type": transaction_enum,
-            "price": dec_price,
-            "currency": currency_enum,
-            "scraped_at": datetime.now(UTC),
-            "location": loc,
-            "infrastructure": self.infrastructure,
-            "legal": self.legal,
-            "description": self.description,
-            "land_area_m2": self.land_area_m2,
-        }
+        title = self.title or "Bazoš inzerát"
+        listing_url = HttpUrl(self.url)
+        scraped_at = datetime.now(UTC)
 
         if entity_enum == EntityType.LAND:
             return LandProperty(
-                **base_params,
-                entity_type=entity_enum,
+                id=entity_id,
+                title=title,
+                is_active=True,
+                source_id=source_id,
+                url=listing_url,
+                source=SourcePortal.BAZOS,
+                transaction_type=transaction_enum,
+                entity_type=EntityType.LAND,
+                price=self.price,
+                currency=currency_enum,
+                scraped_at=scraped_at,
+                location=loc,
+                infrastructure=self.infrastructure,
+                legal=self.legal,
+                description=self.description,
+                land_area_m2=self.land_area_m2,
             )
 
         return BuildingProperty(
-            **base_params,
+            id=entity_id,
+            title=title,
+            is_active=True,
+            source_id=source_id,
+            url=listing_url,
+            source=SourcePortal.BAZOS,
+            transaction_type=transaction_enum,
             entity_type=entity_enum,
+            price=self.price,
+            currency=currency_enum,
+            scraped_at=scraped_at,
+            location=loc,
+            infrastructure=self.infrastructure,
+            legal=self.legal,
+            description=self.description,
+            land_area_m2=self.land_area_m2,
             usable_area_m2=self.usable_area_m2,
             built_up_area_m2=self.built_up_area_m2,
             material=self.material,

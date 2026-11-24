@@ -1,127 +1,67 @@
-from datetime import date, datetime
 from typing import Any
 
 from loguru import logger
+from pydantic import ValidationError
 
 from src.contracts.base import BuildingProperty, LandProperty
 from src.contracts.portals.bezrealitky import BezrealitkyRawInput
 
 
-def _to_float(value: Any) -> float | None:
-    """Safely converts incoming scalar to float, returning None on missing or invalid data."""
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except ValueError, TypeError:
-        return None
-
-
 class BezrealitkyParser:
-    """Parser and normalizer for raw JSON payloads returned by Bezrealitky GraphQL API."""
+    """Translates raw JSON objects from Bezrealitky GraphQL API into validated domain models."""
 
     @staticmethod
     def parse_advert(
-        advert: dict[str, Any],
+        raw: dict[str, Any],
     ) -> BuildingProperty | LandProperty | None:
-        """Transforms a raw GraphQL estate dictionary into a strictly typed domain entity."""
-        advert_id = str(advert.get("id", ""))
-        if not advert_id or advert_id == "None":
-            return None
-
+        """Parses a single Advert object from GraphQL list into a materialized domain property."""
         try:
-            # 1. Resolve raw category values from GraphQL response
-            raw_offer_type = str(advert.get("offerType") or "")
-            raw_estate_type = str(advert.get("estateType") or "")
-
-            # Check compatibility against input contract mappings
-            if (
-                raw_offer_type not in BezrealitkyRawInput._TRANSACTION_MAP
-                or raw_estate_type not in BezrealitkyRawInput._ENTITY_MAP
-            ):
-                logger.debug(
-                    f"Skipping listing {advert_id}: Unsupported category "
-                    f"({raw_offer_type}/{raw_estate_type})"
-                )
+            source_id = str(raw.get("id"))
+            if not source_id:
                 return None
 
-            # 2. Extract address components and GPS coordinates
-            raw_gps = advert.get("gps")
-            gps_node: dict[str, Any] = raw_gps if isinstance(raw_gps, dict) else {}
-
-            latitude = _to_float(gps_node.get("lat"))
-            longitude = _to_float(gps_node.get("lng"))
-
-            # Bezrealitky GraphQL returns address as a string or structured dict
-            address_val = advert.get("address")
-            municipality: str | None = None
-            postal_code: str | None = None
-            region: str | None = None
-            district: str | None = None
-
-            if isinstance(address_val, dict):
-                municipality = address_val.get("city")
-                postal_code = address_val.get("zip")
-                region = address_val.get("region")
-                district = address_val.get("district")
-            elif isinstance(address_val, str):
-                municipality = address_val.strip()
-
-            # 3. Parse availability date (handles YYYY-MM-DD or ISO datetime strings)
-            available_from_raw = advert.get("availableFrom")
-            available_date: date | None = None
-            if available_from_raw:
-                try:
-                    date_str = str(available_from_raw).split("T")[0]
-                    available_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                except ValueError, TypeError:
-                    logger.debug(f"Failed to parse availableFrom: {available_from_raw}")
-
-            # 4. Extract infrastructure tags
-            raw_tags = advert.get("tags")
-            tags = raw_tags if isinstance(raw_tags, list) else []
-
-            has_electricity = (
-                True if "ELECTRICITY" in tags or advert.get("hasElectricity") else None
+            # Spatial coordinates extraction
+            gps_data = raw.get("gps") or {}
+            latitude = (
+                float(gps_data["lat"]) if gps_data.get("lat") is not None else None
             )
-            has_gas = True if "GAS" in tags or advert.get("hasGas") else None
-            has_water = True if "WATER" in tags or advert.get("hasWater") else None
-            has_waste = True if "SEWER" in tags or advert.get("hasWaste") else None
+            longitude = (
+                float(gps_data["lng"]) if gps_data.get("lng") is not None else None
+            )
 
-            # 5. Populate validation boundary model
+            # Raw input validation boundary instantiation
             raw_input = BezrealitkyRawInput(
-                source_id=advert_id,
-                uri=str(advert.get("uri") or f"nemovitost/{advert_id}"),
-                offer_type=raw_offer_type,
-                estate_type=raw_estate_type,
-                title=str(
-                    advert.get("name") or advert.get("title") or "Bezrealitky listing"
-                ),
-                description=advert.get("description"),
-                price=_to_float(advert.get("price")),
-                currency=str(advert.get("currency") or "czk").lower(),
-                region=region,
-                district=district,
-                municipality=municipality,
-                postal_code=postal_code,
+                source_id=source_id,
+                uri=raw.get("uri") or f"inzerat/{source_id}",
+                offer_type=raw.get("offerType") or "PRODEJ",
+                estate_type=raw.get("estateType") or "BYT",
+                title=raw.get("title") or "Bezrealitky inzerát",
+                description=raw.get("description"),
+                price=float(raw["price"]) if raw.get("price") is not None else None,
+                currency=str(raw.get("currency") or "czk").lower(),
+                municipality=raw.get("city"),
+                district=raw.get("cityDistrict"),
+                postal_code=raw.get("zip"),
                 latitude=latitude,
                 longitude=longitude,
-                surface=_to_float(advert.get("surface")),
-                surface_land=_to_float(advert.get("surfaceLand")),
-                condition=advert.get("condition"),
-                construction=advert.get("construction"),
-                ownership=advert.get("ownership"),
-                penb=advert.get("penb"),
-                available_from=available_date,
-                has_water=has_water,
-                has_electricity=has_electricity,
-                has_gas=has_gas,
-                has_waste=has_waste,
+                surface=float(raw["surface"])
+                if raw.get("surface") is not None
+                else None,
+                surface_land=(
+                    float(raw["surfaceLand"])
+                    if raw.get("surfaceLand") is not None
+                    else None
+                ),
+                condition=raw.get("condition"),
+                construction=raw.get("construction"),
+                ownership=raw.get("ownership"),
+                penb=raw.get("penb"),
             )
 
-            # 6. Materialize into strict domain model (BuildingProperty / LandProperty)
             return raw_input.materialize()
 
-        except Exception as e:
-            logger.error(f"Failed to parse Bezrealitky advert node {advert_id}: {e}")
+        except (ValidationError, ValueError, TypeError, KeyError) as exc:
+            logger.debug(
+                f"Validation failed for Bezrealitky advert {raw.get('id')}: {exc}"
+            )
             return None

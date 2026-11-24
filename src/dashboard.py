@@ -1,35 +1,23 @@
-import os
-from pathlib import Path
+from typing import cast
 
 import polars as pl
 import streamlit as st
-from pyiceberg.catalog import load_catalog
-from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
+from pyiceberg.exceptions import (
+    NoSuchNamespaceError,
+    NoSuchTableError,
+    RESTError,
+)
+
+from src.storage.catalog import get_catalog
 
 
 @st.cache_data(ttl=60)
-def load_data(transaction: str, entity: str) -> pl.DataFrame:
-    """Načítá data z Iceberg tabulky ve vrstvě Silver."""
-
-    # Pověření pro podkladovou vrstvu s3fs (vyhne se odeslání do Nessie REST API)
-    os.environ["AWS_ACCESS_KEY_ID"] = "admin"
-    os.environ["AWS_SECRET_ACCESS_KEY"] = "password"
-    os.environ["AWS_ENDPOINT_URL"] = "http://localhost:9000"
-    os.environ["AWS_ALLOW_HTTP"] = "true"
-    os.environ["AWS_REGION"] = "us-east-1"
-
+def load_iceberg_table(table_identifier: str) -> pl.DataFrame:
+    """Reads an Apache Iceberg table into a Polars DataFrame via Nessie REST catalog."""
     try:
-        catalog = load_catalog(
-            "default",
-            **{
-                "type": "rest",
-                "uri": "http://localhost:19120/iceberg/",
-                "s3.endpoint": "http://localhost:9000",
-                "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
-            },
-        )
-        table = catalog.load_table(f"silver.bazos_{transaction}_{entity}")
-        df = pl.scan_iceberg(table).collect()
+        catalog = get_catalog()
+        table = catalog.load_table(table_identifier)
+        df = cast(pl.DataFrame, pl.scan_iceberg(table).collect())
 
         if "available_from" in df.columns:
             df = df.with_columns(pl.col("available_from").cast(pl.Date))
@@ -37,116 +25,247 @@ def load_data(transaction: str, entity: str) -> pl.DataFrame:
         return df
     except NoSuchTableError, NoSuchNamespaceError:
         return pl.DataFrame()
-    except Exception as e:
-        st.error(f"Failed to load data from Iceberg: {e}")
+    except (RESTError, OSError, ValueError) as exc:
+        st.error(f"Chyba při načítání tabulky '{table_identifier}': {exc}")
         return pl.DataFrame()
 
 
-def main() -> None:
-    """Main execution block for the Streamlit application."""
-    st.set_page_config(page_title="Real-Estate Watchdog", layout="wide")
-    st.title("Real-Estate Watchdog: Data Explorer")
+def _safe_median(series: pl.Series) -> float | None:
+    """Safely narrows a Polars median result to float | None."""
+    val = series.median()
+    if isinstance(val, (int, float)):
+        return float(val)
+    return None
 
-    # Left sidebar
-    st.sidebar.header("Filtrace segmentu")
-    transaction = st.sidebar.selectbox("Transakce", ["prodam", "pronajmu"])
-    entity = st.sidebar.selectbox(
-        "Kategorie",
-        [
-            "byt",
-            "dum",
-            "chata",
-            "pozemek",
-            "zahrada",
-            "kancelar",
-            "sklad",
-            "prostory",
-            "restaurace",
-            "garaz",
-            "ostatni",
+
+def _format_czk(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:,.0f} Kč".replace(",", " ")
+
+
+def render_market_overview(metrics_df: pl.DataFrame) -> None:
+    """Renders regional market benchmarks from gold.market_metrics."""
+    st.subheader("Regionální tržní přehled (Gold Layer)")
+
+    if metrics_df.is_empty():
+        st.info(
+            "Tabulka `gold.market_metrics` zatím neobsahuje žádná data. "
+            "Spusťte nejprve ELT pipeline."
+        )
+        return
+
+    col1, col2 = st.columns(2)
+    tx_options = sorted(metrics_df["transaction_type"].drop_nulls().unique().to_list())
+    ent_options = sorted(metrics_df["entity_type"].drop_nulls().unique().to_list())
+
+    selected_tx = col1.selectbox("Typ transakce", tx_options, key="gold_tx")
+    selected_ent = col2.selectbox("Typ nemovitosti", ent_options, key="gold_ent")
+
+    filtered = metrics_df.filter(
+        (pl.col("transaction_type") == selected_tx)
+        & (pl.col("entity_type") == selected_ent)
+    )
+
+    if filtered.is_empty():
+        st.warning("Pro zvolenou kombinaci nejsou k dispozici agregované metriky.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Sledované okresy", filtered.height)
+    c2.metric("Aktivní inzeráty celkem", int(filtered["active_listings"].sum()))
+    c3.metric(
+        "Medián ceny za m²",
+        _format_czk(_safe_median(filtered["median_price_per_m2"])),
+    )
+
+    st.dataframe(
+        filtered,
+        width="stretch",
+        hide_index=True,
+        column_order=[
+            "region",
+            "district",
+            "active_listings",
+            "inactive_listings",
+            "median_price",
+            "median_price_per_m2",
+            "mean_price_per_m2",
+            "median_area_m2",
+            "median_days_on_market",
         ],
     )
 
-    # Přidání přepínače do sidebaru
-    st.sidebar.divider()
-    show_inactive = st.sidebar.checkbox(
-        "Zobrazit i smazané inzeráty (historie)", value=False
+
+def render_investment_opportunities(opps_df: pl.DataFrame) -> None:
+    """Renders undervalued listings from gold.investment_opportunities."""
+    st.subheader("Podhodnocené investiční příležitosti (Gold Layer)")
+
+    if opps_df.is_empty():
+        st.info(
+            "Zatím nebyly detekovány žádné podhodnocené nabídky v `gold.investment_opportunities`."
+        )
+        return
+
+    min_discount = st.slider(
+        "Minimální sleva oproti mediánu okresu (%)",
+        min_value=20,
+        max_value=70,
+        value=25,
+        step=5,
     )
 
-    df = load_data(transaction, entity)
+    filtered = opps_df.filter(pl.col("discount_pct") >= float(min_discount))
 
-    if df.is_empty():
-        st.warning(f"Žádná data pro kombinaci: {transaction} {entity}")
-        return
+    st.metric("Nalezené příležitosti", filtered.height)
 
-    # Vyfiltrování smazaných inzerátů z výpočtů a tabulky
-    if not show_inactive:
-        df = df.filter(pl.col("is_active") == True)
-
-    if df.is_empty():
-        st.info("V této kategorii nejsou žádné aktivní inzeráty.")
-        return
-
-    # Aggregation
-    total_listings = df.height
-    avg_price = df["price"].mean()
-    median_price = df["price"].median()
-
-    # Dashboard layout
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Aktivní inzeráty", total_listings)
-
-    if avg_price is not None:
-        # Format as standard Czech currency with spaces as thousands separators
-        formatted_avg = f"{avg_price:,.0f}".replace(",", " ")
-        formatted_median = f"{median_price:,.0f}".replace(",", " ")
-
-        col2.metric("Průměrná cena (Kč)", formatted_avg)
-        col3.metric("Medián ceny (Kč)", formatted_median)
-    else:
-        col2.metric("Průměrná cena (Kč)", "N/A")
-        col3.metric("Medián ceny (Kč)", "N/A")
-
-    st.divider()
-
-    st.subheader("Konsolidovaný datový rámec")
     st.dataframe(
-        df,
+        filtered,
         width="stretch",
         hide_index=True,
-        height=800,
+        column_order=[
+            "discount_pct",
+            "source",
+            "title",
+            "district",
+            "municipality",
+            "transaction_type",
+            "entity_type",
+            "price",
+            "usable_area_m2",
+            "price_per_m2",
+            "segment_median_price_m2",
+            "url",
+        ],
+        column_config={
+            "url": st.column_config.LinkColumn(display_text="Otevřít inzerát"),
+            "discount_pct": st.column_config.NumberColumn(
+                "Sleva (%)", format="%.1f %%"
+            ),
+        },
+    )
+
+
+def render_silver_explorer(silver_df: pl.DataFrame) -> None:
+    """Renders searchable and deduplicated property explorer from silver.properties."""
+    st.subheader("Průzkumník nemovitostí (Unified Silver Layer)")
+
+    if silver_df.is_empty():
+        st.warning("Tabulka `silver.properties` neobsahuje žádná data.")
+        return
+
+    with st.sidebar:
+        st.header("Filtry (Silver Explorer)")
+        sources = sorted(silver_df["source"].drop_nulls().unique().to_list())
+        selected_sources = st.multiselect("Zdrojový portál", sources, default=sources)
+
+        transactions = sorted(
+            silver_df["transaction_type"].drop_nulls().unique().to_list()
+        )
+        selected_tx = st.selectbox("Transakce", transactions, key="silver_tx")
+
+        entities = sorted(silver_df["entity_type"].drop_nulls().unique().to_list())
+        selected_ent = st.selectbox("Kategorie", entities, key="silver_ent")
+
+        regions = ["Všechny kraje"] + sorted(
+            silver_df["region"].drop_nulls().unique().to_list()
+        )
+        selected_region = st.selectbox("Kraj", regions)
+
+        show_inactive = st.checkbox(
+            "Zobrazit i smazané inzeráty (historie)", value=False
+        )
+        deduplicate_cross_portal = st.checkbox(
+            "Skrýt duplicity napříč portály", value=True
+        )
+
+    filtered = silver_df.filter(
+        pl.col("source").is_in(selected_sources)
+        & (pl.col("transaction_type") == selected_tx)
+        & (pl.col("entity_type") == selected_ent)
+    )
+
+    if selected_region != "Všechny kraje":
+        filtered = filtered.filter(pl.col("region") == selected_region)
+
+    if not show_inactive:
+        filtered = filtered.filter(pl.col("is_active"))
+
+    if deduplicate_cross_portal and "canonical_property_id" in filtered.columns:
+        sort_col = "scraped_at" if "scraped_at" in filtered.columns else "last_seen_at"
+        filtered = filtered.sort(sort_col).unique(
+            subset=["canonical_property_id"], keep="last"
+        )
+
+    if filtered.is_empty():
+        st.info("Zvoleným filtrům neodpovídají žádné nemovitosti.")
+        return
+
+    median_area = _safe_median(filtered["usable_area_m2"])
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Počet nemovitostí", filtered.height)
+    col2.metric("Medián ceny", _format_czk(_safe_median(filtered["price"])))
+    col3.metric("Medián ceny / m²", _format_czk(_safe_median(filtered["price_per_m2"])))
+    col4.metric(
+        "Medián plochy",
+        f"{median_area:.1f} m²" if median_area is not None else "N/A",
+    )
+
+    st.dataframe(
+        filtered,
+        width="stretch",
+        hide_index=True,
+        height=700,
         column_order=[
             "is_active",
             "source",
             "title",
             "price",
+            "price_per_m2",
             "currency",
-            "url",
-            "scraped_at",
             "region",
             "district",
             "municipality",
-            "water",
-            "waste",
-            "electricity",
-            "gas",
-            "heating",
-            "ownership",
-            "price_note",
-            "available_from",
-            "is_foreclosure",
-            "is_insolvency",
-            "is_share",
-            "land_area_m2",
             "usable_area_m2",
-            "description",
-            "built_up_area_m2",
-            "material",
+            "land_area_m2",
             "condition",
+            "material",
             "energy_class",
+            "ownership",
+            "first_seen_at",
+            "last_seen_at",
+            "url",
         ],
         column_config={"url": st.column_config.LinkColumn(display_text="Odkaz")},
     )
+
+
+def main() -> None:
+    """Main entry point for the Streamlit analytical dashboard."""
+    st.set_page_config(page_title="Real-Estate Watchdog", layout="wide")
+    st.title("Real-Estate Watchdog — Medallion Lakehouse Explorer")
+
+    silver_df = load_iceberg_table("silver.properties")
+    metrics_df = load_iceberg_table("gold.market_metrics")
+    opps_df = load_iceberg_table("gold.investment_opportunities")
+
+    tab_silver, tab_opps, tab_market = st.tabs(
+        [
+            "Průzkumník nemovitostí (Silver)",
+            "Investiční příležitosti (Gold)",
+            "Tržní benchmarky (Gold)",
+        ]
+    )
+
+    with tab_silver:
+        render_silver_explorer(silver_df)
+
+    with tab_opps:
+        render_investment_opportunities(opps_df)
+
+    with tab_market:
+        render_market_overview(metrics_df)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,13 @@
 # --- Environment isolation (uv) ---
 .venv/
 
-# --- Local tool configuration (PyCharm) ---
+# --- Local tool configuration & caches ---
 .idea/
+.continue/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.DS_Store
 
 # --- Compiled output and cache (Python) ---
 __pycache__/
@@ -16,10 +21,13 @@ __pycache__/
 *.pem
 
 # --- Physical storage and volumes (Docker, Lakehouse, Data) ---
-data/
+data/*
+!data/static/
 postgres_data/
 minio_data/
 
-# --- Orchestration and logs (Dagster) ---
+# --- Orchestration and logs (Dagster, Loguru) ---
 dagster_home/
+logs/
 *.log
+.tmp_dagster_home*/

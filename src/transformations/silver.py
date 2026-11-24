@@ -1,3 +1,6 @@
+import hashlib
+import math
+
 import polars as pl
 import pyarrow as pa
 from loguru import logger
@@ -6,7 +9,6 @@ from pyiceberg.exceptions import (
     NoSuchNamespaceError,
     NoSuchTableError,
 )
-from pyiceberg.io.pyarrow import pyarrow_to_schema
 from pyiceberg.table import Table
 
 from src.contracts.base import EntityType, SourcePortal
@@ -16,49 +18,161 @@ from src.transformations.enrichment import load_geo_lookup_df
 
 BRONZE_NAMESPACE = "bronze"
 SILVER_NAMESPACE = "silver"
+UNIFIED_SILVER_TABLE = "properties"
 
 
-def _align_to_silver_schema(df: pl.DataFrame) -> pa.Table:
+def haversine_distance_expr(
+    lat1_col: str,
+    lon1_col: str,
+    lat2_col: str,
+    lon2_col: str,
+) -> pl.Expr:
+    """Computes great-circle distance between two GPS coordinates in meters.
+
+    Fully vectorized using native Polars trigonometric expressions.
+    Earth mean radius is parameterized as 6,371,000 meters.
     """
-    Ensures all Silver schema fields exist and converts DataFrame
-    into a strictly typed PyArrow Table matching SILVER_PROPERTY_ARROW_SCHEMA.
-    """
-    for field in SILVER_PROPERTY_ARROW_SCHEMA:
-        if field.name not in df.columns:
-            df = df.with_columns(pl.lit(None).alias(field.name))
+    to_rad = math.pi / 180.0
+    r_meters = 6_371_000.0
 
-    df = df.select([f.name for f in SILVER_PROPERTY_ARROW_SCHEMA])
-    raw_arrow = df.to_arrow()
+    phi1 = pl.col(lat1_col) * to_rad
+    phi2 = pl.col(lat2_col) * to_rad
+    delta_phi = (pl.col(lat2_col) - pl.col(lat1_col)) * to_rad
+    delta_lambda = (pl.col(lon2_col) - pl.col(lon1_col)) * to_rad
 
-    # Bezpečné přetypování sloupců na explicitní typy
-    arrays = []
-    for field in SILVER_PROPERTY_ARROW_SCHEMA:
-        col = raw_arrow.column(field.name)
-        if col.type == pa.null() and pa.types.is_nested(field.type):
-            arrays.append(pa.nulls(len(raw_arrow), type=field.type))
-        else:
-            arrays.append(col.cast(field.type))
+    a = (delta_phi / 2.0).sin().pow(2) + phi1.cos() * phi2.cos() * (
+        delta_lambda / 2.0
+    ).sin().pow(2)
 
-    return pa.Table.from_arrays(arrays, schema=SILVER_PROPERTY_ARROW_SCHEMA)
+    c = 2.0 * a.sqrt().arcsin()
+    return r_meters * c
 
 
-def _get_table_identifiers(source: SourcePortal | str) -> tuple[str, str]:
-    source_str = source.value if isinstance(source, SourcePortal) else source
+def generate_blocking_key(df: pl.DataFrame) -> pl.DataFrame:
+    """Generates coarse partition keys to drastically narrow pairwise comparison space."""
+    area_bucket = (
+        (pl.coalesce(["usable_area_m2", "land_area_m2"]).fill_null(0.0) / 10.0)
+        .round(0)
+        .cast(pl.Int32)
+        .cast(pl.String)
+    )
+
+    clean_municipality = pl.col("municipality").fill_null("unknown").str.to_lowercase()
+
+    return df.with_columns(
+        pl.concat_str(
+            [
+                clean_municipality,
+                pl.col("transaction_type"),
+                pl.col("entity_type"),
+                area_bucket,
+            ],
+            separator=":",
+        ).alias("blocking_key")
+    )
+
+
+def match_cross_portal_duplicates(
+    df: pl.DataFrame,
+    max_distance_meters: float = 150.0,
+    max_price_diff_ratio: float = 0.12,
+    max_area_diff_m2: float = 4.0,
+) -> pl.DataFrame:
+    """Identifies identical properties across portals within blocks and assigns canonical_property_id."""
+    if df.is_empty():
+        return df.with_columns(
+            pl.lit(None).cast(pl.String).alias("canonical_property_id")
+        )
+
+    staged = generate_blocking_key(df)
+
+    candidate_cols = [
+        "id",
+        "source",
+        "blocking_key",
+        "price",
+        "usable_area_m2",
+        "latitude",
+        "longitude",
+    ]
+
+    candidates = (
+        staged.select(candidate_cols)
+        .join(
+            staged.select(candidate_cols),
+            on="blocking_key",
+            how="inner",
+            suffix="_match",
+        )
+        .filter(
+            (pl.col("id") < pl.col("id_match"))
+            & (pl.col("source") != pl.col("source_match"))
+        )
+    )
+
+    if candidates.is_empty():
+        return staged.with_columns(pl.col("id").alias("canonical_property_id")).drop(
+            "blocking_key"
+        )
+
+    price_diff_ratio = (pl.col("price") - pl.col("price_match")).abs() / (
+        pl.coalesce([pl.col("price"), pl.lit(1.0)])
+    )
+    price_condition = price_diff_ratio <= max_price_diff_ratio
+
+    area_delta = (pl.col("usable_area_m2") - pl.col("usable_area_m2_match")).abs()
+    area_condition = area_delta <= max_area_diff_m2
+
+    has_gps = (
+        pl.col("latitude").is_not_null()
+        & pl.col("longitude").is_not_null()
+        & pl.col("latitude_match").is_not_null()
+        & pl.col("longitude_match").is_not_null()
+    )
+
+    distance_expr = haversine_distance_expr(
+        "latitude", "longitude", "latitude_match", "longitude_match"
+    )
+
+    spatial_condition = (has_gps & (distance_expr <= max_distance_meters)) | (
+        (~has_gps) & price_condition & area_condition
+    )
+
+    matched_pairs = candidates.filter(
+        price_condition & area_condition & spatial_condition
+    ).select(
+        pl.col("id_match").alias("matched_id"),
+        pl.col("id").alias("canonical_id"),
+    )
+
     return (
-        f"{BRONZE_NAMESPACE}.{source_str}_properties",
-        f"{SILVER_NAMESPACE}.{source_str}_properties",
+        staged.join(
+            matched_pairs,
+            left_on="id",
+            right_on="matched_id",
+            how="left",
+        )
+        .with_columns(
+            pl.coalesce(["canonical_id", "id"]).alias("canonical_property_id")
+        )
+        .drop(["blocking_key", "canonical_id"])
     )
 
 
 def extract_and_enrich_location(df: pl.DataFrame) -> pl.DataFrame:
-    """Unnests location struct and enriches region/district via Polars join."""
+    """Unnests location struct, extracts flat coordinates, and enriches geography."""
     if "location" in df.columns:
         df = df.unnest("location")
+
+    if "gps" in df.columns:
+        df = df.with_columns(
+            pl.col("gps").struct.field("lat").alias("latitude"),
+            pl.col("gps").struct.field("lon").alias("longitude"),
+        ).drop("gps")
 
     geo_df = load_geo_lookup_df()
 
     if "postal_code" in df.columns and not geo_df.is_empty():
-        # Standardize postal code format to match lookup key
         df = df.with_columns(
             pl.col("postal_code")
             .cast(pl.String)
@@ -106,16 +220,9 @@ def clean_legal_context(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def compute_derived_metrics(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Computes analytical metrics such as price per square meter.
-    Strictly partitions area calculation by entity type:
-    - LAND: strictly uses land_area_m2.
-    - BUILDINGS (apartment, house, commercial, other): uses usable_area_m2,
-      with built_up_area_m2 as a secondary fallback.
-    """
+    """Computes analytical metrics such as price per square meter."""
     building_area = pl.coalesce(["usable_area_m2", "built_up_area_m2"])
 
-    # Select appropriate area column based on physical nature of the property
     target_area = (
         pl.when(pl.col("entity_type") == EntityType.LAND.value)
         .then(pl.col("land_area_m2"))
@@ -134,55 +241,143 @@ def compute_derived_metrics(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def process_silver(source: SourcePortal | str) -> Table | None:
-    """
-    Executes Silver transformation for a specific source.
-    Returns the created/updated Table or None if Bronze is empty.
-    """
+def calculate_lifecycle_and_deduplicate(df: pl.DataFrame) -> pl.DataFrame:
+    """Computes lifecycle timestamps per listing and keeps strictly the latest snapshot."""
+    return (
+        df.with_columns(
+            pl.col("scraped_at")
+            .min()
+            .over(["source", "source_id"])
+            .alias("first_seen_at"),
+            pl.col("scraped_at")
+            .max()
+            .over(["source", "source_id"])
+            .alias("last_seen_at"),
+        )
+        .sort("scraped_at")
+        .unique(subset=["source", "source_id"], keep="last")
+    )
+
+
+def compute_content_hash(df: pl.DataFrame) -> pl.DataFrame:
+    """Computes deterministic SHA-256 hash over core attributes for change tracking."""
+    payload_expr = pl.concat_str(
+        [
+            pl.col("title").fill_null(""),
+            pl.col("price").fill_null(0.0).cast(pl.String),
+            pl.col("usable_area_m2").fill_null(0.0).cast(pl.String),
+            pl.col("land_area_m2").fill_null(0.0).cast(pl.String),
+            pl.col("condition").fill_null(""),
+            pl.col("description").fill_null(""),
+        ],
+        separator="|",
+    )
+
+    raw_payloads = df.select(payload_expr.alias("payload"))["payload"].to_list()
+    hashes = [hashlib.sha256(item.encode("utf-8")).hexdigest() for item in raw_payloads]
+
+    return df.with_columns(pl.Series("content_hash", hashes, dtype=pl.String))
+
+
+def _align_to_silver_schema(df: pl.DataFrame) -> pa.Table:
+    """Aligns Polars DataFrame to the exact Silver PyArrow schema."""
+    missing_expressions = [
+        pl.lit(None).alias(field.name)
+        for field in SILVER_PROPERTY_ARROW_SCHEMA
+        if field.name not in df.columns
+    ]
+    if missing_expressions:
+        df = df.with_columns(missing_expressions)
+
+    df = df.select([field.name for field in SILVER_PROPERTY_ARROW_SCHEMA])
+    raw_arrow = df.to_arrow()
+
+    arrays = [
+        raw_arrow.column(field.name).cast(field.type)
+        for field in SILVER_PROPERTY_ARROW_SCHEMA
+    ]
+
+    return pa.Table.from_arrays(arrays, schema=SILVER_PROPERTY_ARROW_SCHEMA)
+
+
+def _load_and_clean_bronze(source: SourcePortal) -> pl.DataFrame | None:
+    """Loads a single Bronze Iceberg table and applies structural unnesting and cleaning."""
     catalog = get_catalog()
-    bronze_identifier, silver_identifier = _get_table_identifiers(source)
+    table_identifier = f"{BRONZE_NAMESPACE}.{source.value}_properties"
 
     try:
-        bronze_table = catalog.load_table(bronze_identifier)
+        bronze_table = catalog.load_table(table_identifier)
         df = pl.scan_iceberg(bronze_table).collect()
 
         if df.is_empty():
-            logger.warning(
-                f"Bronze table {bronze_identifier} is empty. Silver skipped."
-            )
+            logger.info(f"Bronze table {table_identifier} is empty.")
             return None
 
-        # Deterministic deduplication
-        df = df.sort("scraped_at").unique(subset=["source_id"], keep="last")
-
+        # Apply structural unnesting and enrichment per portal
         df = extract_and_enrich_location(df)
         df = clean_infrastructure(df)
         df = clean_legal_context(df)
         df = compute_derived_metrics(df)
+        df = calculate_lifecycle_and_deduplicate(df)
+        df = compute_content_hash(df)
 
-        arrow_table = _align_to_silver_schema(df)
-
-        try:
-            catalog.create_namespace(SILVER_NAMESPACE)
-        except NamespaceAlreadyExistsError:
-            pass
-
-        try:
-            table = catalog.load_table(silver_identifier)
-            table.overwrite(arrow_table)
-        except NoSuchTableError:
-            table = catalog.create_table(
-                identifier=silver_identifier,
-                schema=pyarrow_to_schema(arrow_table.schema),
-            )
-            table.append(arrow_table)
-
-        logger.info(f"Silver layer updated: {silver_identifier} ({df.height} records)")
-        return table
+        return df
 
     except NoSuchTableError, NoSuchNamespaceError:
-        logger.warning(f"Bronze table {bronze_identifier} not found. Skipping Silver.")
+        logger.info(f"Bronze table {table_identifier} not found, skipping source.")
         return None
-    except Exception as e:
-        logger.error(f"Failed to process Silver for {source}: {e}")
-        raise
+
+
+def process_silver(
+    sources: list[SourcePortal] | None = None,
+) -> Table | None:
+    """Orchestrates unified Silver layer processing across multiple portal sources.
+
+    1. Loads and cleans raw records from all specified Bronze tables.
+    2. Unions datasets into a cohesive multi-portal DataFrame.
+    3. Executes cross-portal Entity Resolution to discover identical physical properties.
+    4. Enforces strict Silver PyArrow schema.
+    5. Atomically overwrites the unified Iceberg table `silver.properties`.
+    """
+    target_sources = sources or [SourcePortal.BAZOS, SourcePortal.BEZREALITKY]
+    catalog = get_catalog()
+    silver_identifier = f"{SILVER_NAMESPACE}.{UNIFIED_SILVER_TABLE}"
+
+    cleaned_dfs: list[pl.DataFrame] = []
+    for src in target_sources:
+        src_df = _load_and_clean_bronze(src)
+        if src_df is not None and not src_df.is_empty():
+            cleaned_dfs.append(src_df)
+
+    if not cleaned_dfs:
+        logger.warning("No Bronze data found across any source. Silver skipped.")
+        return None
+
+    # Diagonal concatenation preserves disjoint portal attributes as nulls
+    unified_df = pl.concat(cleaned_dfs, how="diagonal_relaxed")
+
+    # Cross-portal Entity Resolution: matches identical properties across portals
+    unified_df = match_cross_portal_duplicates(unified_df)
+
+    arrow_table = _align_to_silver_schema(unified_df)
+
+    try:
+        catalog.create_namespace(SILVER_NAMESPACE)
+    except NamespaceAlreadyExistsError:
+        pass
+
+    try:
+        table = catalog.load_table(silver_identifier)
+        table.overwrite(arrow_table)
+    except NoSuchTableError:
+        table = catalog.create_table(
+            identifier=silver_identifier,
+            schema=SILVER_PROPERTY_ARROW_SCHEMA,
+        )
+        table.append(arrow_table)
+
+    logger.info(
+        f"Unified Silver layer updated: {silver_identifier} "
+        f"({unified_df.height} records across {len(cleaned_dfs)} sources)"
+    )
+    return table

@@ -1,7 +1,6 @@
 import asyncio
 import itertools
 import socket
-from typing import Any
 
 import aiohttp
 from dagster import (
@@ -10,6 +9,7 @@ from dagster import (
     MetadataValue,
     asset,
 )
+from pyiceberg.exceptions import RESTError
 
 from src.contracts.base import SourcePortal
 from src.contracts.portals.bazos import BazosInputModel
@@ -72,12 +72,12 @@ async def bronze_bazos_listings(
                     f"(Known records: {len(known_data)})"
                 )
 
-                # 1. Scrape new and price-updated listings
-                accumulated_entities = []
-                async for property_entity in scraper.scrape_section(
-                    transaction, entity, known_data
-                ):
-                    accumulated_entities.append(property_entity)
+                accumulated_entities = [
+                    property_entity
+                    async for property_entity in scraper.scrape_section(
+                        transaction, entity, known_data
+                    )
+                ]
 
                 if accumulated_entities:
                     save_to_iceberg(
@@ -91,14 +91,11 @@ async def bronze_bazos_listings(
                         f"for {transaction}/{entity} (Batch: {run_id})"
                     )
 
-                # 2. Reconcile active listings (Tombstones for deleted ads)
                 active_properties = get_active_bronze_properties(
                     SOURCE_BAZOS, tx_enum, ent_enum
                 )
                 if active_properties:
-                    tombstones: list[
-                        dict[str, Any]
-                    ] = await reconciler.verify_and_deactivate(
+                    tombstones = await reconciler.verify_and_deactivate(
                         active_records=active_properties,
                         transaction=tx_enum,
                         entity_type=ent_enum,
@@ -115,8 +112,14 @@ async def bronze_bazos_listings(
                             f"for {transaction}/{entity} (Batch: {run_id})"
                         )
 
-            except Exception as e:
-                context.log.error(f"Failed category {transaction}/{entity}: {e}")
+            except (
+                aiohttp.ClientError,
+                RESTError,
+                ValueError,
+                RuntimeError,
+                OSError,
+            ) as exc:
+                context.log.error(f"Failed category {transaction}/{entity}: {exc}")
                 continue
 
             await asyncio.sleep(1.0)
@@ -155,7 +158,6 @@ async def bronze_bezrealitky_listings(
         scraper = BezrealitkyScraper(session)
 
         for transaction, entity in targets:
-            # Resolve canonical domain enum values from mapping dictionaries
             api_tx = BezrealitkyRawInput.API_TRANSACTION_MAP[transaction]
             tx_enum = BezrealitkyRawInput._TRANSACTION_MAP[api_tx].value
 
@@ -169,13 +171,14 @@ async def bronze_bezrealitky_listings(
                     f"(Known records: {len(known_data)})"
                 )
 
-                accumulated_entities = []
-                async for property_entity in scraper.scrape_section(
-                    transaction=transaction,
-                    entity=entity,
-                    known_data=known_data,
-                ):
-                    accumulated_entities.append(property_entity)
+                accumulated_entities = [
+                    property_entity
+                    async for property_entity in scraper.scrape_section(
+                        transaction=transaction,
+                        entity=entity,
+                        known_source_ids=set(known_data.keys()),
+                    )
+                ]
 
                 if accumulated_entities:
                     save_to_iceberg(
@@ -189,9 +192,15 @@ async def bronze_bezrealitky_listings(
                         f"for {transaction}/{entity} (Batch: {run_id})"
                     )
 
-            except Exception as e:
+            except (
+                aiohttp.ClientError,
+                RESTError,
+                ValueError,
+                RuntimeError,
+                OSError,
+            ) as exc:
                 context.log.error(
-                    f"Failed Bezrealitky category {transaction}/{entity}: {e}"
+                    f"Failed Bezrealitky category {transaction}/{entity}: {exc}"
                 )
                 continue
 

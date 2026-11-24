@@ -1,6 +1,5 @@
 import hashlib
-from datetime import UTC, date, datetime, timezone
-from decimal import Decimal
+from datetime import UTC, date, datetime
 from typing import ClassVar
 
 from pydantic import HttpUrl
@@ -33,14 +32,15 @@ class BezrealitkyRawInput(BasePortalInput):
         "PRONAJEM": TransactionType.RENT,
     }
 
-    # GraphQL API Bezrealitky -> Internal EntityType
+    # Verified GraphQL API EstateType -> Internal EntityType
     _ENTITY_MAP: ClassVar[dict[str, EntityType]] = {
-        "FLAT": EntityType.APARTMENT,
-        "HOUSE": EntityType.HOUSE,
-        "CHALET": EntityType.HOUSE,
-        "LAND": EntityType.LAND,
-        "COMMERCIAL": EntityType.COMMERCIAL,
-        "GARAGE": EntityType.OTHER,
+        "BYT": EntityType.APARTMENT,
+        "DUM": EntityType.HOUSE,
+        "REKREACNI_OBJEKT": EntityType.HOUSE,
+        "POZEMEK": EntityType.LAND,
+        "GARAZ": EntityType.OTHER,
+        "KANCELAR": EntityType.COMMERCIAL,
+        "NEBYTOVY_PROSTOR": EntityType.COMMERCIAL,
     }
 
     # API request mapping: CLI / Pipeline arguments -> GraphQL parameters
@@ -49,14 +49,15 @@ class BezrealitkyRawInput(BasePortalInput):
         "pronajmu": "PRONAJEM",
     }
 
+    # CLI / Pipeline arguments -> Verified GraphQL EstateType enum
     API_ENTITY_MAP: ClassVar[dict[str, str]] = {
-        "byt": "FLAT",
-        "dum": "HOUSE",
-        "chaty-a-chalupy": "CHALET",
-        "pozemek": "LAND",
-        "kancelar": "COMMERCIAL",
-        "nebytovy-prostor": "COMMERCIAL",
-        "garaz": "GARAGE",
+        "byt": "BYT",
+        "dum": "DUM",
+        "chaty-a-chalupy": "REKREACNI_OBJEKT",
+        "pozemek": "POZEMEK",
+        "kancelar": "KANCELAR",
+        "nebytovy-prostor": "NEBYTOVY_PROSTOR",
+        "garaz": "GARAZ",
     }
 
     # Mapping of Bezrealitky technical parameters to internal domain enums
@@ -83,7 +84,7 @@ class BezrealitkyRawInput(BasePortalInput):
         "STATE": OwnershipType.MUNICIPAL,
     }
 
-    # 1. Raw payload attributes received from GraphQL response
+    # Raw payload attributes from Bezrealitky API
     source_id: str
     uri: str
     offer_type: str
@@ -94,7 +95,7 @@ class BezrealitkyRawInput(BasePortalInput):
     price: float | None = None
     currency: str = "czk"
 
-    # 2. Spatial attributes and coordinates
+    # Precise spatial attributes
     region: str | None = None
     district: str | None = None
     municipality: str | None = None
@@ -102,18 +103,18 @@ class BezrealitkyRawInput(BasePortalInput):
     latitude: float | None = None
     longitude: float | None = None
 
-    # 3. Dimensional surface areas in m2
+    # Physical dimensions in m2
     surface: float | None = None
     surface_land: float | None = None
 
-    # 4. Technical construction and legal parameters
+    # Technical parameters
     condition: str | None = None
     construction: str | None = None
     ownership: str | None = None
     penb: str | None = None
     available_from: date | None = None
 
-    # 5. Infrastructure indicators
+    # Utility indicators
     has_water: bool | None = None
     has_electricity: bool | None = None
     has_gas: bool | None = None
@@ -130,7 +131,7 @@ class BezrealitkyRawInput(BasePortalInput):
         return list(cls.API_ENTITY_MAP.keys())
 
     def _build_location(self) -> Location:
-        """Constructs a validated domain Location entity with optional GPS coordinates."""
+        """Constructs a validated domain Location entity with optional coordinates."""
         gps = None
         if self.latitude is not None and self.longitude is not None:
             gps = GPSCoordinates(lat=self.latitude, lon=self.longitude)
@@ -146,7 +147,7 @@ class BezrealitkyRawInput(BasePortalInput):
         )
 
     def _build_infrastructure(self) -> Infrastructure | None:
-        """Constructs an infrastructure context if utility indicators are present."""
+        """Constructs an infrastructure context if any utility indicator is present."""
         if not any(
             v is not None
             for v in (
@@ -165,9 +166,11 @@ class BezrealitkyRawInput(BasePortalInput):
 
     def _build_legal_context(self) -> LegalContext:
         """Translates raw ownership and availability into domain LegalContext."""
-        ownership_enum = None
-        if self.ownership and self.ownership in self._OWNERSHIP_MAP:
-            ownership_enum = self._OWNERSHIP_MAP[self.ownership]
+        ownership_enum = (
+            self._OWNERSHIP_MAP[self.ownership]
+            if self.ownership and self.ownership in self._OWNERSHIP_MAP
+            else None
+        )
 
         return LegalContext(
             ownership=ownership_enum,
@@ -184,7 +187,7 @@ class BezrealitkyRawInput(BasePortalInput):
         transaction_enum = self._TRANSACTION_MAP[self.offer_type]
         entity_enum = self._ENTITY_MAP[self.estate_type]
 
-        # Deterministic Lakehouse entity ID: sha256(BEZREALITKY_source_id)
+        # Deterministic Lakehouse entity ID: sha256(bezrealitky_<source_id>)
         entity_id = hashlib.sha256(
             f"{SourcePortal.BEZREALITKY.value}_{self.source_id}".encode()
         ).hexdigest()
@@ -195,36 +198,37 @@ class BezrealitkyRawInput(BasePortalInput):
             else f"https://www.bezrealitky.cz/nemovitosti-byty-domy/{self.uri.lstrip('/')}"
         )
 
-        dec_price = Decimal(str(self.price)) if self.price is not None else None
         currency_enum = (
             Currency(self.currency.lower())
             if self.currency.lower() in Currency
             else Currency.CZK
         )
 
-        base_params = {
-            "id": entity_id,
-            "title": self.title,
-            "is_active": True,
-            "source_id": self.source_id,
-            "url": HttpUrl(full_url),
-            "source": SourcePortal.BEZREALITKY,
-            "transaction_type": transaction_enum,
-            "price": dec_price,
-            "currency": currency_enum,
-            "scraped_at": datetime.now(UTC),
-            "location": self._build_location(),
-            "infrastructure": self._build_infrastructure(),
-            "legal": self._build_legal_context(),
-            "land_area_m2": self.surface_land,
-            "usable_area_m2": self.surface,
-            "description": self.description,
-        }
+        listing_url = HttpUrl(full_url)
+        scraped_at = datetime.now(UTC)
+        location = self._build_location()
+        infrastructure = self._build_infrastructure()
+        legal = self._build_legal_context()
 
         if entity_enum == EntityType.LAND:
             return LandProperty(
-                **base_params,
-                entity_type=entity_enum,
+                id=entity_id,
+                title=self.title,
+                is_active=True,
+                source_id=self.source_id,
+                url=listing_url,
+                source=SourcePortal.BEZREALITKY,
+                transaction_type=transaction_enum,
+                entity_type=EntityType.LAND,
+                price=self.price,
+                currency=currency_enum,
+                scraped_at=scraped_at,
+                location=location,
+                infrastructure=infrastructure,
+                legal=legal,
+                land_area_m2=self.surface_land,
+                usable_area_m2=self.surface,
+                description=self.description,
             )
 
         condition_enum = self._CONDITION_MAP.get(self.condition or "")
@@ -236,8 +240,23 @@ class BezrealitkyRawInput(BasePortalInput):
         )
 
         return BuildingProperty(
-            **base_params,
+            id=entity_id,
+            title=self.title,
+            is_active=True,
+            source_id=self.source_id,
+            url=listing_url,
+            source=SourcePortal.BEZREALITKY,
+            transaction_type=transaction_enum,
             entity_type=entity_enum,
+            price=self.price,
+            currency=currency_enum,
+            scraped_at=scraped_at,
+            location=location,
+            infrastructure=infrastructure,
+            legal=legal,
+            land_area_m2=self.surface_land,
+            usable_area_m2=self.surface,
+            description=self.description,
             material=material_enum,
             condition=condition_enum,
             energy_class=energy_enum,

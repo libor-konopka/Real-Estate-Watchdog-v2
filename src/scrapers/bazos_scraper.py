@@ -1,8 +1,10 @@
 import asyncio
 from collections.abc import AsyncGenerator
+from typing import ClassVar
 
 import aiohttp
 from loguru import logger
+from pydantic import ValidationError
 
 from src.contracts.base import BuildingProperty, LandProperty
 from src.contracts.portals.bazos import BazosInputModel
@@ -16,7 +18,7 @@ class BazosScraper:
     skipping of existing listings, and transformation into domain entities.
     """
 
-    _HEADERS: dict[str, str] = {
+    _HEADERS: ClassVar[dict[str, str]] = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -198,7 +200,7 @@ class BazosScraper:
                     )
                     await asyncio.sleep(wait_seconds)
 
-                except Exception as e:
+                except (ValidationError, ValueError, TypeError, AttributeError) as e:
                     logger.error(
                         f"Unrecoverable parsing/validation error for {entity_url}: {e}"
                     )

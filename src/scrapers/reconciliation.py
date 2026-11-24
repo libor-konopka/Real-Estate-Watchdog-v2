@@ -63,7 +63,7 @@ class BazosReconciler:
                     f"Transient network error probing listing {url}: {exc}. Preserving active state."
                 )
                 return True
-            except Exception as exc:
+            except (ValueError, RuntimeError, OSError) as exc:
                 logger.error(f"Unexpected error probing listing {url}: {exc}")
                 return True
 

@@ -103,18 +103,30 @@ def load_geo_lookup_df() -> pl.DataFrame:
             }
         )
 
-    df = pl.read_csv(file_path)
+    df = pl.read_csv(file_path, schema_overrides={"zipcode": pl.String})
 
-    # Normalize postal code (strip whitespace)
-    df = df.with_columns(
-        pl.col("zipcode").str.replace_all(r"\s+", "").alias("postal_code"),
-        pl.col("district")
-        .replace_strict(DISTRICT_TO_REGION, default="Unknown")
-        .alias("enriched_region"),
-        pl.col("district").alias("enriched_district"),
-        pl.col("name").alias("enriched_municipality"),
-    ).select(
-        ["postal_code", "enriched_region", "enriched_district", "enriched_municipality"]
+    # Normalize postal code (strip whitespace) and ensure 1:1 lookup per postal code
+    df = (
+        df.with_columns(
+            pl.col("zipcode")
+            .cast(pl.String)
+            .str.replace_all(r"\s+", "")
+            .alias("postal_code"),
+            pl.col("district")
+            .replace_strict(DISTRICT_TO_REGION, default="Unknown")
+            .alias("enriched_region"),
+            pl.col("district").alias("enriched_district"),
+            pl.col("name").alias("enriched_municipality"),
+        )
+        .select(
+            [
+                "postal_code",
+                "enriched_region",
+                "enriched_district",
+                "enriched_municipality",
+            ]
+        )
+        .unique(subset=["postal_code"], keep="first")
     )
 
     return df
