@@ -1,4 +1,3 @@
-import polars as pl
 from dagster import (
     AssetExecutionContext,
     MaterializeResult,
@@ -27,9 +26,9 @@ def gold_market_analytics(
     context.log.info("Executing Gold layer aggregation and market analysis...")
     manager = get_catalog_manager()
 
-    metrics_table, opportunities_table = process_gold()
+    result = process_gold()
 
-    if metrics_table is None and opportunities_table is None:
+    if result is None:
         context.log.warning("Gold processing yielded no output (empty Silver table).")
         return MaterializeResult(
             metadata={
@@ -39,30 +38,9 @@ def gold_market_analytics(
             }
         )
 
-    metrics_count = (
-        int(
-            pl.scan_iceberg(metrics_table)
-            .select(pl.len().alias("count"))
-            .collect()
-            .item()
-        )
-        if metrics_table is not None
-        else 0
-    )
-    opportunities_count = (
-        int(
-            pl.scan_iceberg(opportunities_table)
-            .select(pl.len().alias("count"))
-            .collect()
-            .item()
-        )
-        if opportunities_table is not None
-        else 0
-    )
-
     context.log.info(
-        f"Gold tables materialized: {metrics_count} segment metrics, "
-        f"{opportunities_count} bargain opportunities discovered."
+        f"Gold tables materialized: {result.metrics_count} segment metrics, "
+        f"{result.opportunities_count} bargain opportunities discovered."
     )
 
     return MaterializeResult(
@@ -72,7 +50,9 @@ def gold_market_analytics(
             "opportunities_table": MetadataValue.text(
                 manager.gold_opportunities_table_id
             ),
-            "total_market_segments": MetadataValue.int(metrics_count),
-            "bargain_opportunities_count": MetadataValue.int(opportunities_count),
+            "total_market_segments": MetadataValue.int(result.metrics_count),
+            "bargain_opportunities_count": MetadataValue.int(
+                result.opportunities_count
+            ),
         }
     )

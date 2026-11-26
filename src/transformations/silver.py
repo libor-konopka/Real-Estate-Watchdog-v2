@@ -1,5 +1,6 @@
 import hashlib
 import math
+from collections.abc import Sequence
 
 import polars as pl
 import pyarrow as pa
@@ -11,6 +12,30 @@ from src.contracts.base import EntityType, SourcePortal
 from src.contracts.schemas import SILVER_PROPERTY_ARROW_SCHEMA
 from src.storage.catalog import get_catalog_manager
 from src.transformations.enrichment import load_geo_lookup_df
+
+
+def _effective_area_expr(columns: Sequence[str]) -> pl.Expr:
+    """Resolves effective area expression consistently for buildings and land."""
+    building_cols = [
+        pl.col(col) for col in ("usable_area_m2", "built_up_area_m2") if col in columns
+    ]
+    building_area = (
+        pl.coalesce(building_cols) if building_cols else pl.lit(None, dtype=pl.Float64)
+    )
+    land_area = (
+        pl.col("land_area_m2")
+        if "land_area_m2" in columns
+        else pl.lit(None, dtype=pl.Float64)
+    )
+
+    if "entity_type" not in columns:
+        return pl.coalesce([building_area, land_area])
+
+    return (
+        pl.when(pl.col("entity_type") == EntityType.LAND.value)
+        .then(land_area)
+        .otherwise(building_area)
+    )
 
 
 def haversine_distance_expr(
@@ -43,10 +68,26 @@ def haversine_distance_expr(
 def generate_blocking_key(df: pl.DataFrame) -> pl.DataFrame:
     """Generates coarse partition keys to narrow pairwise comparison space."""
     area_bucket = (
-        (pl.coalesce(["usable_area_m2", "land_area_m2"]).fill_null(0.0) / 10.0)
+        (_effective_area_expr(df.columns).fill_null(0.0) / 10.0)
         .round(0)
         .cast(pl.Int32)
         .cast(pl.String)
+    )
+
+    clean_municipality = (
+        pl.col("municipality").cast(pl.String).fill_null("unknown").str.to_lowercase()
+    )
+
+    return df.with_columns(
+        pl.concat_str(
+            [
+                clean_municipality,
+                pl.col("transaction_type"),
+                pl.col("entity_type"),
+                area_bucket,
+            ],
+            separator=":",
+        ).alias("blocking_key")
     )
 
     clean_municipality = (
@@ -71,6 +112,8 @@ def match_cross_portal_duplicates(
     max_distance_meters: float = 150.0,
     max_price_diff_ratio: float = 0.12,
     max_area_diff_m2: float = 4.0,
+    max_no_gps_price_diff_ratio: float = 0.05,
+    max_no_gps_area_diff_m2: float = 2.0,
 ) -> pl.DataFrame:
     """Identifies identical properties across portals and assigns canonical ID."""
     if df.is_empty():
@@ -78,26 +121,56 @@ def match_cross_portal_duplicates(
             pl.lit(None).cast(pl.String).alias("canonical_property_id")
         )
 
-    staged = generate_blocking_key(df).with_columns(
-        pl.coalesce(["usable_area_m2", "land_area_m2"]).alias("_effective_area_m2")
+    effective_area = _effective_area_expr(df.columns)
+    staged = df.with_columns(
+        effective_area.alias("_effective_area_m2"),
+        (effective_area.fill_null(0.0) / 10.0).round(0).cast(pl.Int32).alias("_bucket"),
+        pl.col("municipality")
+        .cast(pl.String)
+        .fill_null("unknown")
+        .str.to_lowercase()
+        .alias("_municipality_key"),
     )
 
+    optional_cols = [
+        col for col in ("postal_code", "currency") if col in staged.columns
+    ]
     candidate_cols = [
         "id",
         "source",
         "municipality",
-        "blocking_key",
+        "_municipality_key",
+        "transaction_type",
+        "entity_type",
+        "_bucket",
         "price",
         "_effective_area_m2",
         "latitude",
         "longitude",
+        *optional_cols,
     ]
 
+    # Expand right-hand bucket to [b-1, b, b+1] to avoid 10 m² rounding boundary misses
+    right_candidates = (
+        staged.select(candidate_cols)
+        .with_columns(
+            pl.concat_list(
+                [
+                    pl.col("_bucket") - 1,
+                    pl.col("_bucket"),
+                    pl.col("_bucket") + 1,
+                ]
+            ).alias("_bucket")
+        )
+        .explode("_bucket", empty_as_null=False)
+    )
+
+    join_keys = ["_municipality_key", "transaction_type", "entity_type", "_bucket"]
     candidates = (
         staged.select(candidate_cols)
         .join(
-            staged.select(candidate_cols),
-            on="blocking_key",
+            right_candidates,
+            on=join_keys,
             how="inner",
             suffix="_match",
         )
@@ -107,28 +180,37 @@ def match_cross_portal_duplicates(
         )
     )
 
+    temp_cols = ["_effective_area_m2", "_bucket", "_municipality_key"]
+
     if candidates.is_empty():
         return staged.with_columns(pl.col("id").alias("canonical_property_id")).drop(
-            ["blocking_key", "_effective_area_m2"]
+            temp_cols
         )
 
     max_price = pl.max_horizontal("price", "price_match")
     price_diff_ratio = (pl.col("price") - pl.col("price_match")).abs() / max_price
-    price_condition = (
+    valid_prices = (
         pl.col("price").is_not_null()
         & pl.col("price_match").is_not_null()
         & (pl.col("price") > 0)
         & (pl.col("price_match") > 0)
-        & (price_diff_ratio <= max_price_diff_ratio)
     )
 
     area_delta = (
         pl.col("_effective_area_m2") - pl.col("_effective_area_m2_match")
     ).abs()
-    area_condition = (
+    valid_areas = (
         pl.col("_effective_area_m2").is_not_null()
         & pl.col("_effective_area_m2_match").is_not_null()
-        & (area_delta <= max_area_diff_m2)
+    )
+
+    currency_condition = (
+        (
+            pl.col("currency").str.to_lowercase()
+            == pl.col("currency_match").str.to_lowercase()
+        )
+        if "currency" in candidates.columns
+        else pl.lit(True)
     )
 
     has_gps = (
@@ -143,16 +225,45 @@ def match_cross_portal_duplicates(
         normalized_municipality != "unknown"
     )
 
+    same_postal_code = (
+        (
+            pl.col("postal_code").cast(pl.String).str.replace_all(r"\s+", "")
+            == pl.col("postal_code_match").cast(pl.String).str.replace_all(r"\s+", "")
+        )
+        & pl.col("postal_code").is_not_null()
+        & (pl.col("postal_code").cast(pl.String).str.len_chars() > 0)
+        if "postal_code" in candidates.columns
+        else pl.lit(False)
+    )
+
     distance_expr = haversine_distance_expr(
         "latitude", "longitude", "latitude_match", "longitude_match"
     )
 
-    spatial_condition = (has_gps & (distance_expr <= max_distance_meters)) | (
-        (~has_gps) & has_known_municipality & price_condition & area_condition
+    gps_match = (
+        has_gps
+        & (distance_expr <= max_distance_meters)
+        & (price_diff_ratio <= max_price_diff_ratio)
+        & (area_delta <= max_area_diff_m2)
+    )
+
+    # Without GPS coordinates, require exact postal code match and tighter tolerances
+    # to avoid false positives across large municipalities (e.g., Prague or Brno).
+    fallback_match = (
+        (~has_gps)
+        & has_known_municipality
+        & same_postal_code
+        & (price_diff_ratio <= max_no_gps_price_diff_ratio)
+        & (area_delta <= max_no_gps_area_diff_m2)
     )
 
     matched_pairs = (
-        candidates.filter(price_condition & area_condition & spatial_condition)
+        candidates.filter(
+            valid_prices
+            & valid_areas
+            & currency_condition
+            & (gps_match | fallback_match)
+        )
         .with_columns(
             pl.when(has_gps)
             .then(distance_expr)
@@ -178,7 +289,7 @@ def match_cross_portal_duplicates(
         .with_columns(
             pl.coalesce(["canonical_id", "id"]).alias("canonical_property_id")
         )
-        .drop(["blocking_key", "_effective_area_m2", "canonical_id"])
+        .drop([*temp_cols, "canonical_id"])
     )
 
 
@@ -205,8 +316,8 @@ def extract_and_enrich_location(df: pl.DataFrame) -> pl.DataFrame:
 
         df = df.join(geo_df, on="postal_code", how="left")
         df = df.with_columns(
-            pl.coalesce(["region", "enriched_region"]).alias("region"),
-            pl.coalesce(["district", "enriched_district"]).alias("district"),
+            pl.coalesce(["enriched_region", "region"]).alias("region"),
+            pl.coalesce(["enriched_district", "district"]).alias("district"),
             pl.coalesce(["municipality", "enriched_municipality"]).alias(
                 "municipality"
             ),
@@ -244,13 +355,7 @@ def clean_legal_context(df: pl.DataFrame) -> pl.DataFrame:
 
 def compute_derived_metrics(df: pl.DataFrame) -> pl.DataFrame:
     """Computes analytical metrics such as price per square meter."""
-    building_area = pl.coalesce(["usable_area_m2", "built_up_area_m2"])
-
-    target_area = (
-        pl.when(pl.col("entity_type") == EntityType.LAND.value)
-        .then(pl.col("land_area_m2"))
-        .otherwise(building_area)
-    )
+    target_area = _effective_area_expr(df.columns)
 
     return df.with_columns(
         pl.when(

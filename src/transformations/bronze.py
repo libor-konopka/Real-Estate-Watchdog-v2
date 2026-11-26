@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import socket
 import uuid
+from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
@@ -10,13 +11,15 @@ import aiohttp
 import polars as pl
 import pyarrow as pa
 from loguru import logger
-from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError, RESTError
+from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 
 from src.contracts.base import (
     ActiveListingRef,
     BuildingProperty,
+    EntityType,
     LandProperty,
     SourcePortal,
+    TransactionType,
 )
 from src.contracts.portals.bazos import BazosInputModel
 from src.contracts.portals.bezrealitky import BezrealitkyRawInput
@@ -246,7 +249,7 @@ def save_to_iceberg(
         f"Appended {arrow_table.num_rows} rows to {manager.bronze_table_id(source)} "
         f"(batch={resolved_batch_id})."
     )
-    return arrow_table.num_rows
+    return int(arrow_table.num_rows)
 
 
 def _load_latest_bronze_slice(
@@ -271,14 +274,16 @@ def _load_latest_bronze_slice(
             (pl.col("transaction_type") == transaction_type)
             & (pl.col("entity_type") == entity_type)
         )
-        .select(["source_id", "url", "price", "is_active", "scraped_at"])
+        .select(["source_id", "url", "price", "is_active", "scraped_at", "ingested_at"])
         .collect(),
     )
 
     if df.is_empty():
         return df
 
-    return df.sort("scraped_at").unique(subset=["source_id"], keep="last")
+    return df.sort(["scraped_at", "ingested_at"]).unique(
+        subset=["source_id"], keep="last", maintain_order=True
+    )
 
 
 def _get_active_bronze_state(
@@ -332,73 +337,89 @@ async def ingest_bazos_portal(
     scraper = BazosScraper(session)
     reconciler = BazosReconciler(session)
 
-    targets = list(
-        itertools.product(
-            BazosInputModel.get_supported_transactions(),
-            BazosInputModel.get_supported_entities(),
-        )
+    grouped_targets: dict[tuple[TransactionType, EntityType], list[tuple[str, str]]] = (
+        defaultdict(list)
     )
+    for transaction, entity in itertools.product(
+        BazosInputModel.get_supported_transactions(),
+        BazosInputModel.get_supported_entities(),
+    ):
+        tx_enum, ent_enum = BazosInputModel.resolve_enums(transaction, entity)
+        grouped_targets[(tx_enum, ent_enum)].append((transaction, entity))
 
     scraped_count = 0
     deactivated_count = 0
+    total_slugs = sum(len(slugs) for slugs in grouped_targets.values())
+    failed_slugs = 0
 
-    for transaction, entity in targets:
-        tx_enum, ent_enum = BazosInputModel.resolve_enums(transaction, entity)
+    for (tx_enum, ent_enum), slug_pairs in grouped_targets.items():
+        known_data, active_props = await asyncio.to_thread(
+            _get_active_bronze_state, source, tx_enum.value, ent_enum.value
+        )
+        seen_ids: set[str] = set()
+        group_had_errors = False
 
-        try:
-            known_data, active_props = await asyncio.to_thread(
-                _get_active_bronze_state, source, tx_enum.value, ent_enum.value
-            )
-            active_log.info(
-                f"[{source.value}] Scraping {transaction}/{entity} "
-                f"(known: {len(known_data)})"
-            )
-
-            entities = [
-                item
-                async for item in scraper.scrape_section(
-                    transaction, entity, known_data
-                )
-            ]
-            if entities:
-                await asyncio.to_thread(save_to_iceberg, entities, source, batch_id)
-                scraped_count += len(entities)
+        for transaction, entity in slug_pairs:
+            try:
                 active_log.info(
-                    f"[{source.value}] Appended {len(entities)} items "
-                    f"for {transaction}/{entity} (batch={batch_id})"
+                    f"[{source.value}] Scraping {transaction}/{entity} "
+                    f"(known: {len(known_data)})"
                 )
 
-            fresh_ids = {item.source_id for item in entities}
-            props_to_reconcile = [
-                ref for ref in active_props if ref.source_id not in fresh_ids
-            ]
-
-            if props_to_reconcile:
-                tombstones = await reconciler.verify_and_deactivate(
-                    active_records=props_to_reconcile,
-                    transaction=tx_enum.value,
-                    entity_type=ent_enum.value,
-                )
-                if tombstones:
-                    await asyncio.to_thread(
-                        save_to_iceberg, tombstones, source, batch_id
+                entities = [
+                    item
+                    async for item in scraper.scrape_section(
+                        transaction=transaction,
+                        entity=entity,
+                        known_data=known_data,
+                        seen_ids=seen_ids,
                     )
-                    deactivated_count += len(tombstones)
+                ]
+                if entities:
+                    await asyncio.to_thread(save_to_iceberg, entities, source, batch_id)
+                    scraped_count += len(entities)
+                    for item in entities:
+                        known_data[item.source_id] = item.price
                     active_log.info(
-                        f"[{source.value}] Deactivated {len(tombstones)} listings "
+                        f"[{source.value}] Appended {len(entities)} items "
                         f"for {transaction}/{entity} (batch={batch_id})"
                     )
 
-        except (
-            aiohttp.ClientError,
-            RESTError,
-            ValueError,
-            RuntimeError,
-            OSError,
-        ) as exc:
-            active_log.error(f"[{source.value}] Error in {transaction}/{entity}: {exc}")
+            except (
+                aiohttp.ClientError,
+                ValueError,
+                RuntimeError,
+                OSError,
+            ) as exc:
+                group_had_errors = True
+                failed_slugs += 1
+                active_log.error(
+                    f"[{source.value}] Error in {transaction}/{entity}: {exc}"
+                )
 
-        await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)
+
+        props_to_reconcile = [
+            ref for ref in active_props if ref.source_id not in seen_ids
+        ]
+        if props_to_reconcile and not group_had_errors:
+            tombstones = await reconciler.verify_and_deactivate(
+                active_records=props_to_reconcile,
+                transaction=tx_enum.value,
+                entity_type=ent_enum.value,
+            )
+            if tombstones:
+                await asyncio.to_thread(save_to_iceberg, tombstones, source, batch_id)
+                deactivated_count += len(tombstones)
+                active_log.info(
+                    f"[{source.value}] Deactivated {len(tombstones)} listings "
+                    f"for {tx_enum.value}/{ent_enum.value} (batch={batch_id})"
+                )
+
+    if total_slugs > 0 and failed_slugs == total_slugs:
+        raise RuntimeError(
+            f"[{source.value}] All {total_slugs} scraping targets failed."
+        )
 
     return scraped_count, deactivated_count
 
@@ -414,74 +435,88 @@ async def ingest_bezrealitky_portal(
     scraper = BezrealitkyScraper(session)
     reconciler = BezrealitkyReconciler(session)
 
-    targets = list(
-        itertools.product(
-            BezrealitkyRawInput.get_supported_transactions(),
-            BezrealitkyRawInput.get_supported_entities(),
-        )
+    grouped_targets: dict[tuple[TransactionType, EntityType], list[tuple[str, str]]] = (
+        defaultdict(list)
     )
+    for transaction, entity in itertools.product(
+        BezrealitkyRawInput.get_supported_transactions(),
+        BezrealitkyRawInput.get_supported_entities(),
+    ):
+        tx_enum, ent_enum = BezrealitkyRawInput.resolve_enums(transaction, entity)
+        grouped_targets[(tx_enum, ent_enum)].append((transaction, entity))
 
     scraped_count = 0
     deactivated_count = 0
+    total_slugs = sum(len(slugs) for slugs in grouped_targets.values())
+    failed_slugs = 0
 
-    for transaction, entity in targets:
-        tx_enum, ent_enum = BezrealitkyRawInput.resolve_enums(transaction, entity)
+    for (tx_enum, ent_enum), slug_pairs in grouped_targets.items():
+        known_data, active_props = await asyncio.to_thread(
+            _get_active_bronze_state, source, tx_enum.value, ent_enum.value
+        )
+        seen_ids: set[str] = set()
+        group_had_errors = False
 
-        try:
-            known_data, active_props = await asyncio.to_thread(
-                _get_active_bronze_state, source, tx_enum.value, ent_enum.value
-            )
-            active_log.info(
-                f"[{source.value}] Scraping {transaction}/{entity} "
-                f"(known: {len(known_data)})"
-            )
-
-            entities = [
-                item
-                async for item in scraper.scrape_section(
-                    transaction=transaction,
-                    entity=entity,
-                    known_data=known_data,
-                )
-            ]
-            if entities:
-                await asyncio.to_thread(save_to_iceberg, entities, source, batch_id)
-                scraped_count += len(entities)
+        for transaction, entity in slug_pairs:
+            try:
                 active_log.info(
-                    f"[{source.value}] Appended {len(entities)} items "
-                    f"for {transaction}/{entity} (batch={batch_id})"
+                    f"[{source.value}] Scraping {transaction}/{entity} "
+                    f"(known: {len(known_data)})"
                 )
 
-            fresh_ids = {item.source_id for item in entities}
-            props_to_reconcile = [
-                ref for ref in active_props if ref.source_id not in fresh_ids
-            ]
-
-            if props_to_reconcile:
-                tombstones = await reconciler.verify_and_deactivate(
-                    active_records=props_to_reconcile,
-                    transaction=tx_enum.value,
-                    entity_type=ent_enum.value,
-                )
-                if tombstones:
-                    await asyncio.to_thread(
-                        save_to_iceberg, tombstones, source, batch_id
+                entities = [
+                    item
+                    async for item in scraper.scrape_section(
+                        transaction=transaction,
+                        entity=entity,
+                        known_data=known_data,
+                        seen_ids=seen_ids,
                     )
-                    deactivated_count += len(tombstones)
+                ]
+                if entities:
+                    await asyncio.to_thread(save_to_iceberg, entities, source, batch_id)
+                    scraped_count += len(entities)
+                    for item in entities:
+                        known_data[item.source_id] = item.price
                     active_log.info(
-                        f"[{source.value}] Deactivated {len(tombstones)} listings "
+                        f"[{source.value}] Appended {len(entities)} items "
                         f"for {transaction}/{entity} (batch={batch_id})"
                     )
 
-        except (
-            aiohttp.ClientError,
-            RESTError,
-            ValueError,
-            RuntimeError,
-            OSError,
-        ) as exc:
-            active_log.error(f"[{source.value}] Error in {transaction}/{entity}: {exc}")
+            except (
+                aiohttp.ClientError,
+                ValueError,
+                RuntimeError,
+                OSError,
+            ) as exc:
+                group_had_errors = True
+                failed_slugs += 1
+                active_log.error(
+                    f"[{source.value}] Error in {transaction}/{entity}: {exc}"
+                )
 
-        await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)
+
+        props_to_reconcile = [
+            ref for ref in active_props if ref.source_id not in seen_ids
+        ]
+        if props_to_reconcile and not group_had_errors:
+            tombstones = await reconciler.verify_and_deactivate(
+                active_records=props_to_reconcile,
+                transaction=tx_enum.value,
+                entity_type=ent_enum.value,
+            )
+            if tombstones:
+                await asyncio.to_thread(save_to_iceberg, tombstones, source, batch_id)
+                deactivated_count += len(tombstones)
+                active_log.info(
+                    f"[{source.value}] Deactivated {len(tombstones)} listings "
+                    f"for {tx_enum.value}/{ent_enum.value} (batch={batch_id})"
+                )
+
+    if total_slugs > 0 and failed_slugs == total_slugs:
+        raise RuntimeError(
+            f"[{source.value}] All {total_slugs} scraping targets failed."
+        )
 
     return scraped_count, deactivated_count

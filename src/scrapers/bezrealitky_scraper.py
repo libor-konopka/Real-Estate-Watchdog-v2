@@ -31,13 +31,15 @@ class BezrealitkyScraper:
         "Referer": "https://www.bezrealitky.cz/",
     }
 
+    _RETRYABLE_STATUS_CODES: ClassVar[frozenset[int]] = frozenset(
+        {429, 500, 502, 503, 504}
+    )
+
     GRAPHQL_QUERY: str = """
     query GetListAdverts(
         $offerType: [OfferType]
-        $estateType: [EstateType]
-        $limit: Int
-        $offset: Int
-        $locale: Locale = CS
+        $estateType: [EstateType]$limit: Int
+        $offset: Int$locale: Locale = CS
     ) {
         listAdverts(
             offerType: $offerType
@@ -106,8 +108,9 @@ class BezrealitkyScraper:
         }
 
         for attempt in range(1, max_retries + 1):
-            async with self.semaphore:
-                try:
+            should_retry = False
+            try:
+                async with self.semaphore:
                     await asyncio.sleep(self.request_delay)
                     async with self.session.post(
                         self.GRAPHQL_ENDPOINT,
@@ -115,33 +118,41 @@ class BezrealitkyScraper:
                         headers=self._HEADERS,
                         timeout=aiohttp.ClientTimeout(total=15.0),
                     ) as response:
-                        if response.status != 200:
+                        if response.status in self._RETRYABLE_STATUS_CODES:
                             logger.warning(
-                                f"GraphQL query failed (status {response.status}), "
+                                f"Transient GraphQL status {response.status}, "
                                 f"attempt {attempt}/{max_retries}"
                             )
-                            if attempt < max_retries:
-                                await asyncio.sleep(2.0**attempt)
-                                continue
+                            should_retry = True
+                        elif response.status != 200:
+                            logger.warning(
+                                f"GraphQL query returned non-retryable status "
+                                f"{response.status}"
+                            )
                             return None
+                        else:
+                            result: dict[str, Any] = await response.json()
 
-                        result: dict[str, Any] = await response.json()
+                            if "errors" in result:
+                                logger.error(
+                                    f"GraphQL returned errors: {result['errors']}"
+                                )
+                                return None
 
-                        if "errors" in result:
-                            logger.error(f"GraphQL returned errors: {result['errors']}")
-                            return None
+                            data = result.get("data")
+                            return data if isinstance(data, dict) else {}
 
-                        return result.get("data", {})
+            except (TimeoutError, aiohttp.ClientError) as exc:
+                logger.warning(
+                    f"Network fault on offset {offset} ({exc}), "
+                    f"attempt {attempt}/{max_retries}"
+                )
+                should_retry = True
 
-                except (TimeoutError, aiohttp.ClientError) as exc:
-                    logger.warning(
-                        f"Network fault on offset {offset} ({exc}), "
-                        f"attempt {attempt}/{max_retries}"
-                    )
-                    if attempt < max_retries:
-                        await asyncio.sleep(2.0**attempt)
-                        continue
+            if should_retry:
+                if attempt == max_retries:
                     return None
+                await asyncio.sleep(2.0**attempt)
 
         return None
 
@@ -152,7 +163,8 @@ class BezrealitkyScraper:
         known_data: dict[str, float | None] | None = None,
         limit_per_page: int = 15,
         max_pages: int = 50,
-        max_consecutive_known: int = 10,
+        max_consecutive_known: int = 30,
+        seen_ids: set[str] | None = None,
     ) -> AsyncIterator[BuildingProperty | LandProperty]:
         """Iterates through GraphQL results and yields new or updated properties."""
         known_records = known_data or {}
@@ -198,6 +210,9 @@ class BezrealitkyScraper:
                 if raw_id is None or not str(raw_id).strip():
                     continue
                 source_id = str(raw_id).strip()
+
+                if seen_ids is not None:
+                    seen_ids.add(source_id)
 
                 raw_price = raw_item.get("price")
                 current_price = float(raw_price) if raw_price is not None else None

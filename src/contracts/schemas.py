@@ -148,3 +148,48 @@ SILVER_PROPERTY_ARROW_SCHEMA = pa.schema(
         pa.field("content_hash", pa.string(), nullable=False),
     ]
 )
+
+# -----------------------------------------------------------------------------
+# GOLD LAYER SCHEMAS (Analytical Data Marts)
+# -----------------------------------------------------------------------------
+GOLD_MARKET_METRICS_ARROW_SCHEMA = pa.schema(
+    [
+        pa.field("region", pa.string(), nullable=False),
+        pa.field("district", pa.string(), nullable=False),
+        pa.field("transaction_type", pa.string(), nullable=False),
+        pa.field("entity_type", pa.string(), nullable=False),
+        pa.field("total_listings", pa.int32(), nullable=False),
+        pa.field("active_listings", pa.int32(), nullable=False),
+        pa.field("inactive_listings", pa.int32(), nullable=False),
+        pa.field("median_price", pa.float64(), nullable=True),
+        pa.field("mean_price", pa.float64(), nullable=True),
+        pa.field("median_price_per_m2", pa.float64(), nullable=True),
+        pa.field("mean_price_per_m2", pa.float64(), nullable=True),
+        pa.field("median_area_m2", pa.float64(), nullable=True),
+        pa.field("median_days_on_market", pa.float64(), nullable=True),
+        pa.field("calculated_at", pa.timestamp("us", tz="UTC"), nullable=False),
+    ]
+)
+
+GOLD_INVESTMENT_OPPORTUNITIES_ARROW_SCHEMA = pa.schema(
+    [
+        pa.field("id", pa.string(), nullable=False),
+        pa.field("canonical_property_id", pa.string(), nullable=False),
+        pa.field("source", pa.string(), nullable=False),
+        pa.field("title", pa.string(), nullable=False),
+        pa.field("url", pa.string(), nullable=False),
+        pa.field("region", pa.string(), nullable=True),
+        pa.field("district", pa.string(), nullable=False),
+        pa.field("municipality", pa.string(), nullable=True),
+        pa.field("transaction_type", pa.string(), nullable=False),
+        pa.field("entity_type", pa.string(), nullable=False),
+        pa.field("price", pa.float64(), nullable=False),
+        pa.field("area_m2", pa.float64(), nullable=False),
+        pa.field("price_per_m2", pa.float64(), nullable=False),
+        pa.field("segment_median_price_m2", pa.float64(), nullable=False),
+        pa.field("discount_pct", pa.float64(), nullable=False),
+        pa.field("segment_sample_size", pa.int32(), nullable=False),
+        pa.field("first_seen_at", pa.timestamp("us", tz="UTC"), nullable=False),
+        pa.field("last_seen_at", pa.timestamp("us", tz="UTC"), nullable=False),
+    ]
+)

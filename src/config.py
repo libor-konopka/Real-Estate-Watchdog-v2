@@ -42,5 +42,4 @@ class StorageSettings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_storage_settings() -> StorageSettings:
     """Returns a cached singleton of validated storage settings."""
-    # Pyright cannot infer runtime env variable injection from BaseSettings.
-    return StorageSettings()  # pyright: ignore[reportCallIssue]
+    return StorageSettings()

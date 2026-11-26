@@ -1,4 +1,7 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
+from unittest.mock import AsyncMock
 
 import polars as pl
 import pytest
@@ -12,15 +15,25 @@ from src.contracts.base import (
     SourcePortal,
     TransactionType,
 )
-from src.contracts.schemas import BRONZE_PROPERTY_ARROW_SCHEMA
+from src.contracts.schemas import (
+    BRONZE_PROPERTY_ARROW_SCHEMA,
+    GOLD_INVESTMENT_OPPORTUNITIES_ARROW_SCHEMA,
+    GOLD_MARKET_METRICS_ARROW_SCHEMA,
+)
+from src.scrapers.bazos_parser import BazosListingCard
+from src.scrapers.bazos_scraper import BazosScraper
+from src.scrapers.bezrealitky_parser import BezrealitkyParser
+from src.scrapers.bezrealitky_scraper import BezrealitkyScraper
 from src.transformations.bronze import properties_to_arrow_table
 from src.transformations.gold import (
+    _align_to_gold_schema,
     compute_investment_opportunities,
     compute_market_metrics,
 )
 from src.transformations.silver import (
     calculate_lifecycle_and_deduplicate,
     compute_derived_metrics,
+    extract_and_enrich_location,
     match_cross_portal_duplicates,
 )
 
@@ -145,6 +158,38 @@ def test_lifecycle_keeps_explicit_null_on_active_update() -> None:
     assert row["last_seen_at"] == t1
 
 
+def test_geo_enrichment_normalizes_district_over_city_ward() -> None:
+    parsed = BezrealitkyParser.parse_advert(
+        {
+            "id": "884422",
+            "uri": "884422-byt-pribram",
+            "offerType": "PRODEJ",
+            "estateType": "BYT",
+            "title": "Byt Příbram",
+            "city": "Příbram",
+            "cityDistrict": "Příbram VII",
+            "zip": "261 01",
+            "gps": {"lat": 0.0, "lng": 0.0},
+        }
+    )
+    assert parsed is not None
+    assert parsed.location.district is None
+    assert parsed.location.gps is None
+
+    # Even if a raw district value is present, PSC lookup enforces canonical district
+    df = pl.DataFrame(
+        {
+            "region": [None],
+            "district": ["Příbram VII"],
+            "municipality": ["Příbram"],
+            "postal_code": ["261 01"],
+        }
+    )
+    enriched = extract_and_enrich_location(df)
+    assert enriched["district"][0] == "Příbram"
+    assert enriched["region"][0] == "Středočeský"
+
+
 def test_match_cross_portal_duplicates_links_identical_listing() -> None:
     df = pl.DataFrame(
         {
@@ -174,6 +219,38 @@ def test_match_cross_portal_duplicates_links_identical_listing() -> None:
     assert canonical_map["a_bazos"] == "a_bazos"
     assert canonical_map["b_bezrealitky"] == "a_bazos"
     assert canonical_map["c_distinct"] == "c_distinct"
+
+
+def test_match_cross_portal_without_gps_requires_matching_postal_code() -> None:
+    df = pl.DataFrame(
+        {
+            "id": ["a_praha2", "b_praha2_dup", "c_praha6_diff_zip"],
+            "source": ["bazos", "bezrealitky", "bezrealitky"],
+            "municipality": ["Praha", "Praha", "Praha"],
+            "postal_code": ["12000", "12000", "16000"],
+            "currency": ["czk", "czk", "czk"],
+            "transaction_type": ["sale", "sale", "sale"],
+            "entity_type": ["apartment", "apartment", "apartment"],
+            "price": [6_500_000.0, 6_600_000.0, 6_550_000.0],
+            "usable_area_m2": [65.0, 66.0, 65.5],
+            "land_area_m2": pl.Series([None, None, None], dtype=pl.Float64),
+            "latitude": pl.Series([None, None, None], dtype=pl.Float64),
+            "longitude": pl.Series([None, None, None], dtype=pl.Float64),
+        }
+    )
+
+    deduped = match_cross_portal_duplicates(df)
+    canonical_map = dict(
+        zip(
+            deduped["id"].to_list(),
+            deduped["canonical_property_id"].to_list(),
+            strict=True,
+        )
+    )
+
+    assert canonical_map["a_praha2"] == "a_praha2"
+    assert canonical_map["b_praha2_dup"] == "a_praha2"
+    assert canonical_map["c_praha6_diff_zip"] == "c_praha6_diff_zip"
 
 
 def test_match_cross_portal_duplicates_skips_unknown_city_without_gps() -> None:
@@ -226,7 +303,7 @@ def test_match_cross_portal_duplicates_handles_land_and_zero_price() -> None:
     assert canonical_map["d_zero_bez"] == "d_zero_bez"
 
 
-def test_gold_metrics_and_investment_opportunities() -> None:
+def test_gold_metrics_and_investment_opportunities_align_to_arrow_schemas() -> None:
     now = datetime.now(UTC)
     earlier = now - timedelta(days=10)
 
@@ -325,6 +402,10 @@ def test_gold_metrics_and_investment_opportunities() -> None:
     assert metrics["median_area_m2"][0] == 60.0
     assert metrics["median_days_on_market"][0] == 10
 
+    metrics_arrow = _align_to_gold_schema(metrics, GOLD_MARKET_METRICS_ARROW_SCHEMA)
+    assert metrics_arrow.schema == GOLD_MARKET_METRICS_ARROW_SCHEMA
+    assert metrics_arrow.num_rows == 1
+
     opps = compute_investment_opportunities(
         silver_df, min_discount_pct=20.0, min_segment_sample_size=5
     )
@@ -332,6 +413,17 @@ def test_gold_metrics_and_investment_opportunities() -> None:
     assert opps["id"][0] == "5"
     assert opps["area_m2"][0] == 60.0
     assert opps["discount_pct"][0] == 30.0
+
+    opps_arrow = _align_to_gold_schema(opps, GOLD_INVESTMENT_OPPORTUNITIES_ARROW_SCHEMA)
+    assert opps_arrow.schema == GOLD_INVESTMENT_OPPORTUNITIES_ARROW_SCHEMA
+    assert opps_arrow.num_rows == 1
+
+    # Empty DataFrames still produce strictly typed 0-row Arrow tables
+    empty_opps_arrow = _align_to_gold_schema(
+        pl.DataFrame(), GOLD_INVESTMENT_OPPORTUNITIES_ARROW_SCHEMA
+    )
+    assert empty_opps_arrow.schema == GOLD_INVESTMENT_OPPORTUNITIES_ARROW_SCHEMA
+    assert empty_opps_arrow.num_rows == 0
 
 
 def test_gold_uses_land_area_for_land_listings() -> None:
@@ -377,3 +469,62 @@ def test_gold_uses_land_area_for_land_listings() -> None:
     assert opps["id"][0] == "land_4"
     assert opps["area_m2"][0] == 1000.0
     assert opps["discount_pct"][0] == 40.0
+
+
+def test_scrapers_record_seen_ids_during_fast_path_skip() -> None:
+    async def _run() -> None:
+        # 1. BazosScraper fast-path tracks skipped source_id in seen_ids
+        bazos = BazosScraper(session=None)  # type: ignore[arg-type]
+        bazos._fetch_catalog_page = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                [
+                    BazosListingCard(
+                        source_id="101",
+                        url="https://reality.bazos.cz/inzerat/101/a.php",
+                        price=3_000_000.0,
+                    )
+                ],
+                [],
+            ]
+        )
+        bazos_seen: set[str] = set()
+        bazos_items = [
+            item
+            async for item in bazos.scrape_section(
+                transaction="prodam",
+                entity="byt",
+                known_data={"101": 3_000_000.0},
+                seen_ids=bazos_seen,
+            )
+        ]
+        assert bazos_items == []
+        assert bazos_seen == {"101"}
+
+        # 2. BezrealitkyScraper fast-path tracks skipped source_id in seen_ids
+        bez = BezrealitkyScraper(session=None)  # type: ignore[arg-type]
+        payload: dict[str, Any] = {
+            "listAdverts": {
+                "list": [
+                    {
+                        "id": "202",
+                        "price": 4_200_000,
+                    }
+                ]
+            }
+        }
+        bez._fetch_graphql_page = AsyncMock(return_value=payload)  # type: ignore[method-assign]
+        bez_seen: set[str] = set()
+        bez_items = [
+            item
+            async for item in bez.scrape_section(
+                transaction="prodam",
+                entity="byt",
+                known_data={"202": 4_200_000.0},
+                limit_per_page=15,
+                seen_ids=bez_seen,
+            )
+        ]
+        assert bez_items == []
+        assert bez_seen == {"202"}
+
+    asyncio.run(_run())

@@ -113,7 +113,7 @@ def load_geo_lookup_df() -> pl.DataFrame:
             .str.replace_all(r"\s+", "")
             .alias("postal_code"),
             pl.col("district")
-            .replace_strict(DISTRICT_TO_REGION, default="Unknown")
+            .replace_strict(DISTRICT_TO_REGION, default=None)
             .alias("enriched_region"),
             pl.col("district").alias("enriched_district"),
             pl.col("name").alias("enriched_municipality"),

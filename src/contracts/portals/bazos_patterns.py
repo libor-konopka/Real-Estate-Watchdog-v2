@@ -11,7 +11,9 @@ RE_WASTE_SEWER = re.compile(r"kanalizac|obecní\s+odpad|stočn[eé]", re.IGNOREC
 RE_WASTE_SEPTIC = re.compile(r"septik", re.IGNORECASE)
 RE_WASTE_CESSPOOL = re.compile(r"jímk[auy]|žump[auy]", re.IGNORECASE)
 
-RE_ELEC = re.compile(r"elekt\w+|el\.|230\s*V|400\s*V|220\s*V|380\s*V", re.IGNORECASE)
+RE_ELEC = re.compile(
+    r"\belekt\w+|\bel\.|230\s*V|400\s*V|220\s*V|380\s*V", re.IGNORECASE
+)
 RE_NO_ELEC = re.compile(
     r"bez\s+(?:zavedené\s+)?elektřiny|bez\s+el\.|elektřina\s+(?:zde\s+)?není",
     re.IGNORECASE,
@@ -36,7 +38,8 @@ RE_HEAT_ELEC = re.compile(
     r"elektrick[ýým]+\s+kot[el][im]?|přímotop[y]?|el\.\s*kotel", re.IGNORECASE
 )
 RE_HEAT_SOLID = re.compile(
-    r"tuh[áá]\s+paliv[ay]?|krbov[áá]\s+kamn[a]?|pelet[ay]?|krb[eo]m?", re.IGNORECASE
+    r"tuh[áéý]\w*\s+paliv\w*|krbov[áéý]\w*\s+kamn\w*|pelet\w*|\bkrb(?:u|em|y)?\b",
+    re.IGNORECASE,
 )
 RE_HEAT_CENTRAL = re.compile(
     r"ústřední|dálkov[eéým]+\s+vytápění|teplárn", re.IGNORECASE
@@ -47,7 +50,11 @@ RE_HEAT_CENTRAL = re.compile(
 # ==========================================
 RE_OWN_PERSONAL = re.compile(r"osobní[mho]?\s+vlastnictví|\bOV\b", re.IGNORECASE)
 RE_OWN_COOP = re.compile(r"družstevní[mho]?\s+vlastnictví|\bDV\b", re.IGNORECASE)
-RE_OWN_MUNI = re.compile(r"obecní[mho]?|městsk[éý][mho]?", re.IGNORECASE)
+RE_OWN_MUNI = re.compile(
+    r"(?:obecní(?:m|ho)?|městsk[éý](?:m|ho)?)\s+(?:vlastnictví|byt\w*|dům|domu)|"
+    r"vlastnictví\s+(?:obce|města)",
+    re.IGNORECASE,
+)
 
 RE_FORECLOSURE = re.compile(r"exekuc[ei]", re.IGNORECASE)
 RE_INSOLVENCY = re.compile(r"insolvenc[ei]", re.IGNORECASE)
@@ -77,7 +84,7 @@ RE_AVAILABLE_REV = re.compile(
 # AREA EXTRACTION (Land)
 # ==========================================
 RE_LAND_AREA_FWD = re.compile(
-    r"(?:pozem\w+|zahrad\w+|parcel\w+|dv[ůo]r\w*|výměr\w*)\D{0,30}?"
+    r"(?:pozem\w+|zahrad\w+|parcel\w+|dv[ůo]r\w*)\D{0,30}?"
     r"(\d+(?:[ \xa0]\d+)*(?:[.,]\d+)?)\s*(?:m[2²\'’´`]?|metr\w*)(?=[.,\s]|$)",
     re.IGNORECASE,
 )
@@ -177,9 +184,10 @@ RE_COND_CONSTRUCTION = re.compile(
 # ENERGY CLASS (PENB)
 # ==========================================
 RE_ENERGY_CLASS = re.compile(
-    r"(?:PENB|energetick[aáé]\s+(?:tříd[ay]|náročnost\w*)|"
-    r"třída\s+energetické\s+náročnosti)[^A-G]{0,15}?(?:\b|\s|:|-)([A-G])\b",
-    re.IGNORECASE,
+    r"(?i:(?:PENB|energetick[aáé]\s+(?:tříd[ay]|náročnost\w*)|"
+    r"třída\s+energetické\s+náročnosti))"
+    r"(?:[\s:\-]+|(?i:je|třída|třídy|budovy|skupina)){0,4}\s*"
+    r"\b([A-Ga-g])\b"
 )
 
 # ==========================================

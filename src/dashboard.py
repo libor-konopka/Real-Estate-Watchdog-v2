@@ -39,6 +39,22 @@ def _safe_median(series: pl.Series) -> float | None:
     return None
 
 
+def _weighted_price_per_m2(df: pl.DataFrame) -> float | None:
+    """Computes listing-count-weighted average of district median prices per m²."""
+    valid = df.filter(
+        pl.col("median_price_per_m2").is_not_null() & (pl.col("total_listings") > 0)
+    )
+    if valid.is_empty():
+        return None
+
+    total_weight = float(valid["total_listings"].sum())
+    if total_weight <= 0:
+        return None
+
+    weighted_sum = float((valid["median_price_per_m2"] * valid["total_listings"]).sum())
+    return weighted_sum / total_weight
+
+
 def _format_czk(value: float | None) -> str:
     if value is None:
         return "N/A"
@@ -76,8 +92,8 @@ def render_market_overview(metrics_df: pl.DataFrame) -> None:
     c1.metric("Sledované okresy", filtered.height)
     c2.metric("Aktivní inzeráty celkem", int(filtered["active_listings"].sum()))
     c3.metric(
-        "Medián ceny za m²",
-        _format_czk(_safe_median(filtered["median_price_per_m2"])),
+        "Vážený průměr mediánů / m²",
+        _format_czk(_weighted_price_per_m2(filtered)),
     )
 
     st.dataframe(
@@ -156,29 +172,36 @@ def render_silver_explorer(silver_df: pl.DataFrame) -> None:
         st.warning("Tabulka `silver.properties` neobsahuje žádná data.")
         return
 
-    with st.sidebar:
-        st.header("Filtry (Silver Explorer)")
+    with st.expander("Filtry průzkumníka", expanded=True):
+        f1, f2, f3, f4 = st.columns(4)
         sources = sorted(silver_df["source"].drop_nulls().unique().to_list())
-        selected_sources = st.multiselect("Zdrojový portál", sources, default=sources)
+        selected_sources = f1.multiselect(
+            "Zdrojový portál", sources, default=sources, key="silver_sources"
+        )
 
         transactions = sorted(
             silver_df["transaction_type"].drop_nulls().unique().to_list()
         )
-        selected_tx = st.selectbox("Transakce", transactions, key="silver_tx")
+        selected_tx = f2.selectbox("Transakce", transactions, key="silver_tx")
 
         entities = sorted(silver_df["entity_type"].drop_nulls().unique().to_list())
-        selected_ent = st.selectbox("Kategorie", entities, key="silver_ent")
+        selected_ent = f3.selectbox("Kategorie", entities, key="silver_ent")
 
         regions = ["Všechny kraje"] + sorted(
             silver_df["region"].drop_nulls().unique().to_list()
         )
-        selected_region = st.selectbox("Kraj", regions)
+        selected_region = f4.selectbox("Kraj", regions, key="silver_region")
 
-        show_inactive = st.checkbox(
-            "Zobrazit i smazané inzeráty (historie)", value=False
+        c_opt1, c_opt2 = st.columns(2)
+        show_inactive = c_opt1.checkbox(
+            "Zobrazit i smazané inzeráty (historie)",
+            value=False,
+            key="silver_inactive",
         )
-        deduplicate_cross_portal = st.checkbox(
-            "Skrýt duplicity napříč portály", value=True
+        deduplicate_cross_portal = c_opt2.checkbox(
+            "Skrýt duplicity napříč portály",
+            value=True,
+            key="silver_dedup",
         )
 
     filtered = silver_df.filter(
@@ -202,10 +225,14 @@ def render_silver_explorer(silver_df: pl.DataFrame) -> None:
         st.info("Zvoleným filtrům neodpovídají žádné nemovitosti.")
         return
 
-    area_col = (
-        "land_area_m2" if selected_ent == EntityType.LAND.value else "usable_area_m2"
+    effective_area_series = (
+        filtered["land_area_m2"]
+        if selected_ent == EntityType.LAND.value
+        else filtered.select(
+            pl.coalesce(["usable_area_m2", "built_up_area_m2"]).alias("area")
+        )["area"]
     )
-    median_area = _safe_median(filtered[area_col])
+    median_area = _safe_median(effective_area_series)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Počet nemovitostí", filtered.height)
@@ -232,6 +259,7 @@ def render_silver_explorer(silver_df: pl.DataFrame) -> None:
             "district",
             "municipality",
             "usable_area_m2",
+            "built_up_area_m2",
             "land_area_m2",
             "condition",
             "material",

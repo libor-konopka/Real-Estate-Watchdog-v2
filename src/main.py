@@ -84,5 +84,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.warning("Pipeline execution interrupted by user.")
     except PIPELINE_ERRORS as exc:
-        logger.critical(f"Fatal error in pipeline execution: {exc}", exc_info=True)
+        logger.opt(exception=True).critical(f"Fatal error in pipeline execution: {exc}")
         sys.exit(1)
