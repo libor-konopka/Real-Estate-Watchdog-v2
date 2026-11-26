@@ -28,6 +28,9 @@ jobs:
       - name: Run Ruff linter
         run: uv run ruff check src tests
 
+      - name: Run Ruff formatter check
+        run: uv run ruff format --check src tests
+
       - name: Run Mypy type checker
         run: uv run mypy src tests
 

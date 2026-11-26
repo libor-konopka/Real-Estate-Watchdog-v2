@@ -10,7 +10,6 @@ from pydantic import (
     Field,
     HttpUrl,
     PlainSerializer,
-    TypeAdapter,
 )
 
 # Custom type: forces conversion of pydantic_core.Url to str during any model_dump()
@@ -213,9 +212,6 @@ PropertyListing = Annotated[
     BuildingProperty | LandProperty,
     Field(discriminator="entity_type"),
 ]
-
-# High-performance TypeAdapter for validating single records
-property_listing_adapter: TypeAdapter[PropertyListing] = TypeAdapter(PropertyListing)
 
 
 @dataclass(slots=True, frozen=True)

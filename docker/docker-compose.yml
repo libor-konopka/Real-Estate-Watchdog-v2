@@ -3,10 +3,11 @@ name: real-estate-watchdog-v2
 services:
   minio:
     image: minio/minio:latest
+    pull_policy: if_not_present
     container_name: lakehouse-minio
     environment:
-      - MINIO_ROOT_USER=admin
-      - MINIO_ROOT_PASSWORD=password
+      - MINIO_ROOT_USER=${AWS_ACCESS_KEY_ID:-admin}
+      - MINIO_ROOT_PASSWORD=${AWS_SECRET_ACCESS_KEY:-password}
     ports:
       - "9000:9000" # S3 API
       - "9001:9001" # MinIO Web Console
@@ -21,37 +22,47 @@ services:
 
   minio-init:
     image: amazon/aws-cli:latest
+    pull_policy: if_not_present
     container_name: lakehouse-minio-init
     depends_on:
       minio:
         condition: service_healthy
     environment:
-      - AWS_ACCESS_KEY_ID=admin
-      - AWS_SECRET_ACCESS_KEY=password
-      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-admin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-password}
+      - AWS_DEFAULT_REGION=${AWS_REGION:-us-east-1}
     entrypoint: /bin/sh -c
     command: >
       "aws --endpoint-url http://minio:9000 s3 mb s3://warehouse || true"
 
   nessie:
     image: ghcr.io/projectnessie/nessie:latest
+    pull_policy: if_not_present
     container_name: lakehouse-nessie
+    user: "0:0" # Ensures write permissions for RocksDB inside the named volume
     depends_on:
       minio:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     ports:
       - "19120:19120"
     environment:
       - QUARKUS_HTTP_PORT=19120
+      - nessie.version.store.type=ROCKSDB
+      - nessie.version.store.persist.rocks.db-path=/nessie/data
       - nessie.catalog.default-warehouse=default
       - nessie.catalog.warehouses.default.location=s3://warehouse/
       - nessie.catalog.service.s3.default-options.endpoint=http://minio:9000
-      - nessie.catalog.service.s3.default-options.region=us-east-1
+      - nessie.catalog.service.s3.default-options.region=${AWS_REGION:-us-east-1}
       - nessie.catalog.service.s3.default-options.path-style-access=true
       - nessie.catalog.service.s3.default-options.auth-type=STATIC
       - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
-      - nessie.catalog.secrets.access-key.name=admin
-      - nessie.catalog.secrets.access-key.secret=password
+      - nessie.catalog.secrets.access-key.name=${AWS_ACCESS_KEY_ID:-admin}
+      - nessie.catalog.secrets.access-key.secret=${AWS_SECRET_ACCESS_KEY:-password}
+    volumes:
+      - nessie_data:/nessie/data
 
 volumes:
   minio_data:
+  nessie_data:

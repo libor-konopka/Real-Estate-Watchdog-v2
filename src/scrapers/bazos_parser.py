@@ -160,7 +160,10 @@ class BazosDOMParser:
             infra.electricity = True
 
         # Gas
-        infra.gas = True if (has_all or patterns.RE_GAS.search(desc)) else None
+        if patterns.RE_NO_GAS.search(desc):
+            infra.gas = False
+        elif has_all or patterns.RE_GAS.search(desc):
+            infra.gas = True
 
         # Heating
         if patterns.RE_HEAT_PUMP.search(desc):

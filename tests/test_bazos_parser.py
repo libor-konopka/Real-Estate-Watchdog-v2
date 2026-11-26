@@ -1,3 +1,5 @@
+import pytest
+
 from src.contracts.base import (
     BuildingCondition,
     BuildingMaterial,
@@ -80,7 +82,7 @@ def test_detail_parser_extracts_structured_attributes() -> None:
     assert legal.is_foreclosure is False
 
 
-def test_extract_land_area_does_not_double_count_repeated_mentions() -> None:
+def test_extract_land_area_does_not_double_count_or_match_apartment_area() -> None:
     html = """
     <html>
     <body>
@@ -102,3 +104,65 @@ def test_extract_land_area_does_not_double_count_repeated_mentions() -> None:
     empty_loc = parser.extract_location()
     assert empty_loc.municipality is None
     assert empty_loc.postal_code is None
+
+    # Regression: apartment description using "o výměře" must not populate land_area_m2
+    apt_land_area = parser.extract_land_area(
+        "Prodej bytu 3+kk", "Byt o výměře 74 m² v 2. patře."
+    )
+    assert apt_land_area is None
+
+
+def test_extract_infrastructure_avoids_false_positives_and_handles_negations() -> None:
+    parser = BazosDOMParser("<html></html>", "https://reality.bazos.cz/inzerat/1/a.php")
+
+    desc_false_pos = (
+        "Klidná čtvrť ve čtvrtém patře, plynulý chod SVJ, bez plynu a bez elektřiny."
+    )
+    infra = parser.extract_infrastructure(desc_false_pos)
+
+    assert infra.water is None
+    assert infra.gas is False
+    assert infra.electricity is False
+
+    # Regression: "tel." must not trigger electricity=True
+    infra_tel = parser.extract_infrastructure("Více info na tel. 777 123 456.")
+    assert infra_tel.electricity is None
+
+    desc_borehole = "Na pozemku je vlastní vrt a přípojka plynu."
+    infra_ok = parser.extract_infrastructure(desc_borehole)
+
+    assert infra_ok.water is not None
+    assert infra_ok.water.value == "borehole"
+    assert infra_ok.gas is True
+
+
+def test_extract_legal_context_avoids_municipal_utility_false_positive() -> None:
+    parser = BazosDOMParser("<html></html>", "https://reality.bazos.cz/inzerat/2/b.php")
+
+    legal_utility = parser.extract_legal_context(
+        "Dům napojen na obecní vodovod a obecní kanalizaci, městská doprava 200 m.",
+        "Prodej rodinného domu",
+    )
+    assert legal_utility.ownership is None
+
+    legal_muni = parser.extract_legal_context(
+        "Převod nájmu obecního bytu v centru města.",
+        "Obecní byt 2+1",
+    )
+    assert legal_muni.ownership == OwnershipType.MUNICIPAL
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("PENB: třída B", EnergyClass.B),
+        ("Energetická náročnost budovy: C", EnergyClass.C),
+        ("Třída energetické náročnosti - G", EnergyClass.G),
+        ("PENB nebyl zatím dodán. Dům je cihlový.", None),
+    ],
+)
+def test_extract_energy_class_handles_czech_phrases(
+    text: str, expected: EnergyClass | None
+) -> None:
+    parser = BazosDOMParser("<html></html>", "https://reality.bazos.cz/inzerat/3/c.php")
+    assert parser.extract_energy_class(text) == expected

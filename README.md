@@ -56,9 +56,9 @@ Built with **Python 3.14**, **Apache Iceberg**, **Project Nessie**, **MinIO**, *
 
 ## Key Engineering Highlights
 
-* **Strict Schema Contracts:** Uses Pydantic v2 discriminated unions (`BuildingProperty` vs. `LandProperty`) at the ingestion boundary and enforces explicit PyArrow schemas (`BRONZE_PROPERTY_ARROW_SCHEMA`, `SILVER_PROPERTY_ARROW_SCHEMA`) before writing Parquet files to Apache Iceberg.
-* **Incremental Extraction & Reconciliation:** Tracks active listing IDs and historical prices in Bronze to skip unchanged records (`fast-path`), while running concurrent `HEAD` reconciliation audits (`BazosReconciler`) to emit deterministic SHA-256 tombstone records for deleted ads.
-* **Cross-Portal Entity Resolution:** Identifies identical physical properties listed across multiple portals using spatial blocking keys, price/area tolerances, and vectorized Haversine GPS distance calculation in Polars.
+* **Strict Schema Contracts:** Uses Pydantic v2 discriminated unions (`BuildingProperty` vs. `LandProperty`) at the ingestion boundary and enforces explicit PyArrow schemas across all Medallion layers (`BRONZE_PROPERTY_ARROW_SCHEMA`, `SILVER_PROPERTY_ARROW_SCHEMA`, `GOLD_MARKET_METRICS_ARROW_SCHEMA`, `GOLD_INVESTMENT_OPPORTUNITIES_ARROW_SCHEMA`) before writing Parquet files to Apache Iceberg.
+* **Incremental Extraction & Reconciliation:** Tracks active listing IDs and historical prices in Bronze to skip unchanged records (`fast-path`), while running concurrent `HEAD` reconciliation audits (`PortalReconciler` for both Bazoš and Bezrealitky) to emit deterministic SHA-256 tombstone records for deleted ads.
+* **Cross-Portal Entity Resolution:** Identifies identical physical properties listed across multiple portals using spatial blocking keys, price/area tolerances, postal-code matching, and vectorized Haversine GPS distance calculation in Polars.
 * **Open Table Format & Git-like Catalog:** Persists versioned Parquet datasets on S3-compatible **MinIO** managed by **Project Nessie** REST Catalog.
 
 ---

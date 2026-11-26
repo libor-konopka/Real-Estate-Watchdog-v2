@@ -59,7 +59,7 @@ class IcebergCatalogManager:
         """Returns fully qualified Bronze table identifier for a given portal."""
         return f"{self.BRONZE_NAMESPACE}.{source.value}_properties"
 
-    def _export_s3_env(self) -> None:
+    def _export_s3_env(self, allow_http: bool) -> None:
         """Exports S3 credentials to environment and disables EC2 IMDS probing."""
         os.environ.setdefault("AWS_ACCESS_KEY_ID", self.settings.aws_access_key_id)
         os.environ.setdefault(
@@ -68,7 +68,7 @@ class IcebergCatalogManager:
         )
         os.environ.setdefault("AWS_ENDPOINT_URL", self.settings.aws_endpoint_url)
         os.environ.setdefault("AWS_REGION", self.settings.aws_region)
-        os.environ.setdefault("AWS_ALLOW_HTTP", "true")
+        os.environ.setdefault("AWS_ALLOW_HTTP", "true" if allow_http else "false")
         os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
 
     def get_catalog(self) -> Catalog:
@@ -76,10 +76,8 @@ class IcebergCatalogManager:
         if self._catalog is not None:
             return self._catalog
 
-        self._export_s3_env()
-        ssl_enabled = str(
-            self.settings.aws_endpoint_url.lower().startswith("https://")
-        ).lower()
+        use_ssl = self.settings.aws_endpoint_url.lower().startswith("https://")
+        self._export_s3_env(allow_http=not use_ssl)
 
         catalog_properties: dict[str, Any] = {
             "type": "rest",
@@ -91,7 +89,7 @@ class IcebergCatalogManager:
             ),
             "s3.region": self.settings.aws_region,
             "s3.path-style-access": str(self.settings.s3_path_style_access).lower(),
-            "s3.ssl.enabled": ssl_enabled,
+            "s3.ssl.enabled": str(use_ssl).lower(),
             "warehouse": self.settings.iceberg_warehouse,
         }
 

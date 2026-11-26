@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import socket
 import uuid
+from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
@@ -10,20 +11,22 @@ import aiohttp
 import polars as pl
 import pyarrow as pa
 from loguru import logger
-from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError, RESTError
+from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 
 from src.contracts.base import (
     ActiveListingRef,
     BuildingProperty,
+    EntityType,
     LandProperty,
     SourcePortal,
+    TransactionType,
 )
 from src.contracts.portals.bazos import BazosInputModel
 from src.contracts.portals.bezrealitky import BezrealitkyRawInput
 from src.contracts.schemas import BRONZE_PROPERTY_ARROW_SCHEMA
 from src.scrapers.bazos_scraper import BazosScraper
 from src.scrapers.bezrealitky_scraper import BezrealitkyScraper
-from src.scrapers.reconciliation import BazosReconciler
+from src.scrapers.reconciliation import BazosReconciler, BezrealitkyReconciler
 from src.storage.catalog import get_catalog_manager
 
 BronzeInputRecord = BuildingProperty | LandProperty | dict[str, Any]
@@ -243,10 +246,10 @@ def save_to_iceberg(
     table.append(arrow_table)
 
     logger.debug(
-        f"Appended {arrow_table.num_rows} rows to bronze.{source.value}_properties "
+        f"Appended {arrow_table.num_rows} rows to {manager.bronze_table_id(source)} "
         f"(batch={resolved_batch_id})."
     )
-    return arrow_table.num_rows
+    return int(arrow_table.num_rows)
 
 
 def _load_latest_bronze_slice(
@@ -257,7 +260,7 @@ def _load_latest_bronze_slice(
     """Reads the latest snapshot per source_id for a portal, transaction, and entity."""
     manager = get_catalog_manager()
     catalog = manager.get_catalog()
-    table_id = f"{manager.BRONZE_NAMESPACE}.{source.value}_properties"
+    table_id = manager.bronze_table_id(source)
 
     try:
         table = catalog.load_table(table_id)
@@ -271,14 +274,36 @@ def _load_latest_bronze_slice(
             (pl.col("transaction_type") == transaction_type)
             & (pl.col("entity_type") == entity_type)
         )
-        .select(["source_id", "url", "price", "is_active", "scraped_at"])
+        .select(["source_id", "url", "price", "is_active", "scraped_at", "ingested_at"])
         .collect(),
     )
 
     if df.is_empty():
         return df
 
-    return df.sort("scraped_at").unique(subset=["source_id"], keep="last")
+    return df.sort(["scraped_at", "ingested_at"]).unique(
+        subset=["source_id"], keep="last", maintain_order=True
+    )
+
+
+def _get_active_bronze_state(
+    source: SourcePortal,
+    transaction_type: str,
+    entity_type: str,
+) -> tuple[dict[str, float | None], list[ActiveListingRef]]:
+    """Returns known active prices and reconciliation refs in a single Bronze scan."""
+    latest_df = _load_latest_bronze_slice(source, transaction_type, entity_type)
+    if latest_df.is_empty():
+        return {}, []
+
+    active_df = latest_df.filter(pl.col("is_active"))
+    rows = active_df.select(["source_id", "url", "price"]).to_dicts()
+
+    known_data = {row["source_id"]: row["price"] for row in rows}
+    active_refs = [
+        ActiveListingRef(source_id=row["source_id"], url=row["url"]) for row in rows
+    ]
+    return known_data, active_refs
 
 
 def get_known_source_ids(
@@ -287,15 +312,8 @@ def get_known_source_ids(
     entity_type: str,
 ) -> dict[str, float | None]:
     """Returns mapping of known active source_id -> latest price for scraping."""
-    latest_df = _load_latest_bronze_slice(source, transaction_type, entity_type)
-    if latest_df.is_empty():
-        return {}
-
-    active_df = latest_df.filter(pl.col("is_active"))
-    return {
-        row["source_id"]: row["price"]
-        for row in active_df.select(["source_id", "price"]).to_dicts()
-    }
+    known_data, _ = _get_active_bronze_state(source, transaction_type, entity_type)
+    return known_data
 
 
 def get_active_bronze_properties(
@@ -304,15 +322,8 @@ def get_active_bronze_properties(
     entity_type: str,
 ) -> list[ActiveListingRef]:
     """Returns lightweight references of active listings for HTTP reconciliation."""
-    latest_df = _load_latest_bronze_slice(source, transaction_type, entity_type)
-    if latest_df.is_empty():
-        return []
-
-    active_df = latest_df.filter(pl.col("is_active"))
-    return [
-        ActiveListingRef(source_id=row["source_id"], url=row["url"])
-        for row in active_df.select(["source_id", "url"]).to_dicts()
-    ]
+    _, active_refs = _get_active_bronze_state(source, transaction_type, entity_type)
+    return active_refs
 
 
 async def ingest_bazos_portal(
@@ -326,67 +337,89 @@ async def ingest_bazos_portal(
     scraper = BazosScraper(session)
     reconciler = BazosReconciler(session)
 
-    targets = list(
-        itertools.product(
-            BazosInputModel.get_supported_transactions(),
-            BazosInputModel.get_supported_entities(),
-        )
+    grouped_targets: dict[tuple[TransactionType, EntityType], list[tuple[str, str]]] = (
+        defaultdict(list)
     )
+    for transaction, entity in itertools.product(
+        BazosInputModel.get_supported_transactions(),
+        BazosInputModel.get_supported_entities(),
+    ):
+        tx_enum, ent_enum = BazosInputModel.resolve_enums(transaction, entity)
+        grouped_targets[(tx_enum, ent_enum)].append((transaction, entity))
 
     scraped_count = 0
     deactivated_count = 0
+    total_slugs = sum(len(slugs) for slugs in grouped_targets.values())
+    failed_slugs = 0
 
-    for transaction, entity in targets:
-        tx_enum, ent_enum = BazosInputModel.resolve_enums(transaction, entity)
+    for (tx_enum, ent_enum), slug_pairs in grouped_targets.items():
+        known_data, active_props = await asyncio.to_thread(
+            _get_active_bronze_state, source, tx_enum.value, ent_enum.value
+        )
+        seen_ids: set[str] = set()
+        group_had_errors = False
 
-        try:
-            known_data = get_known_source_ids(source, tx_enum.value, ent_enum.value)
-            active_log.info(
-                f"[{source.value}] Scraping {transaction}/{entity} "
-                f"(known: {len(known_data)})"
-            )
-
-            entities = [
-                item
-                async for item in scraper.scrape_section(
-                    transaction, entity, known_data
-                )
-            ]
-            if entities:
-                save_to_iceberg(entities, source=source, batch_id=batch_id)
-                scraped_count += len(entities)
+        for transaction, entity in slug_pairs:
+            try:
                 active_log.info(
-                    f"[{source.value}] Appended {len(entities)} items "
-                    f"for {transaction}/{entity} (batch={batch_id})"
+                    f"[{source.value}] Scraping {transaction}/{entity} "
+                    f"(known: {len(known_data)})"
                 )
 
-            active_props = get_active_bronze_properties(
-                source, tx_enum.value, ent_enum.value
-            )
-            if active_props:
-                tombstones = await reconciler.verify_and_deactivate(
-                    active_records=active_props,
-                    transaction=tx_enum.value,
-                    entity_type=ent_enum.value,
-                )
-                if tombstones:
-                    save_to_iceberg(tombstones, source=source, batch_id=batch_id)
-                    deactivated_count += len(tombstones)
+                entities = [
+                    item
+                    async for item in scraper.scrape_section(
+                        transaction=transaction,
+                        entity=entity,
+                        known_data=known_data,
+                        seen_ids=seen_ids,
+                    )
+                ]
+                if entities:
+                    await asyncio.to_thread(save_to_iceberg, entities, source, batch_id)
+                    scraped_count += len(entities)
+                    for item in entities:
+                        known_data[item.source_id] = item.price
                     active_log.info(
-                        f"[{source.value}] Deactivated {len(tombstones)} listings "
+                        f"[{source.value}] Appended {len(entities)} items "
                         f"for {transaction}/{entity} (batch={batch_id})"
                     )
 
-        except (
-            aiohttp.ClientError,
-            RESTError,
-            ValueError,
-            RuntimeError,
-            OSError,
-        ) as exc:
-            active_log.error(f"[{source.value}] Error in {transaction}/{entity}: {exc}")
+            except (
+                aiohttp.ClientError,
+                ValueError,
+                RuntimeError,
+                OSError,
+            ) as exc:
+                group_had_errors = True
+                failed_slugs += 1
+                active_log.error(
+                    f"[{source.value}] Error in {transaction}/{entity}: {exc}"
+                )
 
-        await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)
+
+        props_to_reconcile = [
+            ref for ref in active_props if ref.source_id not in seen_ids
+        ]
+        if props_to_reconcile and not group_had_errors:
+            tombstones = await reconciler.verify_and_deactivate(
+                active_records=props_to_reconcile,
+                transaction=tx_enum.value,
+                entity_type=ent_enum.value,
+            )
+            if tombstones:
+                await asyncio.to_thread(save_to_iceberg, tombstones, source, batch_id)
+                deactivated_count += len(tombstones)
+                active_log.info(
+                    f"[{source.value}] Deactivated {len(tombstones)} listings "
+                    f"for {tx_enum.value}/{ent_enum.value} (batch={batch_id})"
+                )
+
+    if total_slugs > 0 and failed_slugs == total_slugs:
+        raise RuntimeError(
+            f"[{source.value}] All {total_slugs} scraping targets failed."
+        )
 
     return scraped_count, deactivated_count
 
@@ -395,56 +428,95 @@ async def ingest_bezrealitky_portal(
     session: aiohttp.ClientSession,
     batch_id: str,
     log: IngestionLogger | None = None,
-) -> int:
-    """Runs incremental GraphQL API ingestion for Bezrealitky."""
+) -> tuple[int, int]:
+    """Runs incremental GraphQL API ingestion and reconciliation for Bezrealitky."""
     active_log = log or logger
     source = SourcePortal.BEZREALITKY
     scraper = BezrealitkyScraper(session)
+    reconciler = BezrealitkyReconciler(session)
 
-    targets = list(
-        itertools.product(
-            BezrealitkyRawInput.get_supported_transactions(),
-            BezrealitkyRawInput.get_supported_entities(),
-        )
+    grouped_targets: dict[tuple[TransactionType, EntityType], list[tuple[str, str]]] = (
+        defaultdict(list)
     )
+    for transaction, entity in itertools.product(
+        BezrealitkyRawInput.get_supported_transactions(),
+        BezrealitkyRawInput.get_supported_entities(),
+    ):
+        tx_enum, ent_enum = BezrealitkyRawInput.resolve_enums(transaction, entity)
+        grouped_targets[(tx_enum, ent_enum)].append((transaction, entity))
 
     scraped_count = 0
+    deactivated_count = 0
+    total_slugs = sum(len(slugs) for slugs in grouped_targets.values())
+    failed_slugs = 0
 
-    for transaction, entity in targets:
-        tx_enum, ent_enum = BezrealitkyRawInput.resolve_enums(transaction, entity)
+    for (tx_enum, ent_enum), slug_pairs in grouped_targets.items():
+        known_data, active_props = await asyncio.to_thread(
+            _get_active_bronze_state, source, tx_enum.value, ent_enum.value
+        )
+        seen_ids: set[str] = set()
+        group_had_errors = False
 
-        try:
-            known_data = get_known_source_ids(source, tx_enum.value, ent_enum.value)
-            active_log.info(
-                f"[{source.value}] Scraping {transaction}/{entity} "
-                f"(known: {len(known_data)})"
-            )
-
-            entities = [
-                item
-                async for item in scraper.scrape_section(
-                    transaction=transaction,
-                    entity=entity,
-                    known_data=known_data,
-                )
-            ]
-            if entities:
-                save_to_iceberg(entities, source=source, batch_id=batch_id)
-                scraped_count += len(entities)
+        for transaction, entity in slug_pairs:
+            try:
                 active_log.info(
-                    f"[{source.value}] Appended {len(entities)} items "
-                    f"for {transaction}/{entity} (batch={batch_id})"
+                    f"[{source.value}] Scraping {transaction}/{entity} "
+                    f"(known: {len(known_data)})"
                 )
 
-        except (
-            aiohttp.ClientError,
-            RESTError,
-            ValueError,
-            RuntimeError,
-            OSError,
-        ) as exc:
-            active_log.error(f"[{source.value}] Error in {transaction}/{entity}: {exc}")
+                entities = [
+                    item
+                    async for item in scraper.scrape_section(
+                        transaction=transaction,
+                        entity=entity,
+                        known_data=known_data,
+                        seen_ids=seen_ids,
+                    )
+                ]
+                if entities:
+                    await asyncio.to_thread(save_to_iceberg, entities, source, batch_id)
+                    scraped_count += len(entities)
+                    for item in entities:
+                        known_data[item.source_id] = item.price
+                    active_log.info(
+                        f"[{source.value}] Appended {len(entities)} items "
+                        f"for {transaction}/{entity} (batch={batch_id})"
+                    )
 
-        await asyncio.sleep(0.5)
+            except (
+                aiohttp.ClientError,
+                ValueError,
+                RuntimeError,
+                OSError,
+            ) as exc:
+                group_had_errors = True
+                failed_slugs += 1
+                active_log.error(
+                    f"[{source.value}] Error in {transaction}/{entity}: {exc}"
+                )
 
-    return scraped_count
+            await asyncio.sleep(0.5)
+
+        props_to_reconcile = [
+            ref for ref in active_props if ref.source_id not in seen_ids
+        ]
+        if props_to_reconcile and not group_had_errors:
+            tombstones = await reconciler.verify_and_deactivate(
+                active_records=props_to_reconcile,
+                transaction=tx_enum.value,
+                entity_type=ent_enum.value,
+            )
+            if tombstones:
+                await asyncio.to_thread(save_to_iceberg, tombstones, source, batch_id)
+                deactivated_count += len(tombstones)
+                active_log.info(
+                    f"[{source.value}] Deactivated {len(tombstones)} listings "
+                    f"for {tx_enum.value}/{ent_enum.value} (batch={batch_id})"
+                )
+
+    if total_slugs > 0 and failed_slugs == total_slugs:
+        raise RuntimeError(
+            f"[{source.value}] All {total_slugs} scraping targets failed."
+        )
+
+    return scraped_count, deactivated_count

@@ -32,6 +32,10 @@ class BazosScraper:
         "Connection": "keep-alive",
     }
 
+    _RETRYABLE_STATUS_CODES: ClassVar[frozenset[int]] = frozenset(
+        {429, 500, 502, 503, 504}
+    )
+
     # Bazoš displays 20 listings per pagination page
     PAGE_SIZE: int = 20
 
@@ -53,6 +57,7 @@ class BazosScraper:
         known_data: dict[str, float | None] | None = None,
         max_pages: int = 25,
         max_consecutive_known: int = 2,
+        seen_ids: set[str] | None = None,
     ) -> AsyncGenerator[BuildingProperty | LandProperty]:
         """Asynchronously scrapes a section, yielding new or updated properties."""
         known_records = known_data or {}
@@ -76,6 +81,9 @@ class BazosScraper:
 
             cards_to_fetch: list[BazosListingCard] = []
             for card in cards:
+                if seen_ids is not None:
+                    seen_ids.add(card.source_id)
+
                 if card.source_id in known_records:
                     previous_price = known_records[card.source_id]
                     if card.price == previous_price:
@@ -110,20 +118,44 @@ class BazosScraper:
 
             await asyncio.sleep(self._request_delay)
 
-    async def _fetch_catalog_page(self, url: str) -> list[BazosListingCard]:
-        """Fetches and parses a single catalog pagination page."""
-        try:
-            async with self.session.get(url, headers=self._HEADERS) as response:
-                if response.status != 200:
-                    logger.warning(
-                        f"Catalog page returned status {response.status}: {url}"
-                    )
+    async def _fetch_catalog_page(
+        self, url: str, max_retries: int = 3
+    ) -> list[BazosListingCard]:
+        """Fetches and parses a single catalog pagination page with retry logic."""
+        for attempt in range(1, max_retries + 1):
+            should_retry = False
+            try:
+                async with self.session.get(url, headers=self._HEADERS) as response:
+                    if response.status in self._RETRYABLE_STATUS_CODES:
+                        logger.warning(
+                            f"Transient status {response.status} on catalog {url} "
+                            f"(attempt {attempt}/{max_retries})."
+                        )
+                        should_retry = True
+                    elif response.status != 200:
+                        logger.warning(
+                            f"Catalog page returned status {response.status}: {url}"
+                        )
+                        return []
+                    else:
+                        html = await response.text(encoding="utf-8", errors="replace")
+                        return BazosDOMParser.parse_catalog_page(html, self.base_url)
+            except (TimeoutError, aiohttp.ClientError) as e:
+                if attempt == max_retries:
+                    logger.error(f"Network error while fetching catalog {url}: {e}")
                     return []
-                html = await response.text(encoding="utf-8", errors="replace")
-                return BazosDOMParser.parse_catalog_page(html, self.base_url)
-        except (TimeoutError, aiohttp.ClientError) as e:
-            logger.error(f"Network error while fetching catalog {url}: {e}")
-            return []
+                logger.debug(
+                    f"Network issue on catalog {url}: {e} "
+                    f"(attempt {attempt}/{max_retries})."
+                )
+                should_retry = True
+
+            if should_retry:
+                if attempt == max_retries:
+                    return []
+                await asyncio.sleep(2 * attempt)
+
+        return []
 
     async def _process_detail(
         self,
@@ -133,72 +165,88 @@ class BazosScraper:
         max_retries: int = 3,
     ) -> BuildingProperty | LandProperty | None:
         """Fetches listing detail, parses DOM, and returns a domain model."""
-        async with self._semaphore:
-            for attempt in range(1, max_retries + 1):
-                try:
-                    async with self.session.get(
-                        entity_url, headers=self._HEADERS
-                    ) as response:
-                        if response.status != 200:
-                            logger.warning(
-                                f"Failed to fetch detail (status {response.status}): "
-                                f"{entity_url}"
-                            )
-                            return None
+        for attempt in range(1, max_retries + 1):
+            should_retry = False
+            html_content: str | None = None
 
+            try:
+                async with (
+                    self._semaphore,
+                    self.session.get(entity_url, headers=self._HEADERS) as response,
+                ):
+                    if response.status in self._RETRYABLE_STATUS_CODES:
+                        logger.warning(
+                            f"Transient status {response.status} for "
+                            f"{entity_url} (attempt {attempt}/{max_retries})."
+                        )
+                        should_retry = True
+                    elif response.status != 200:
+                        logger.warning(
+                            f"Failed to fetch detail (status {response.status}): "
+                            f"{entity_url}"
+                        )
+                        return None
+                    else:
                         html_content = await response.text(
                             encoding="utf-8", errors="replace"
                         )
 
-                    parser = BazosDOMParser(html_content, entity_url)
-
-                    title = parser.extract_title()
-                    description = parser.extract_description()
-                    price, currency = parser.extract_price()
-                    location = parser.extract_location()
-
-                    combined_text = f"{title} {description}"
-
-                    input_model = BazosInputModel(
-                        url=entity_url,
-                        raw_transaction=raw_transaction,
-                        raw_entity=raw_entity,
-                        title=title,
-                        description=description,
-                        price=price,
-                        currency=currency,
-                        location=location,
-                        postal_code=location.postal_code,
-                        infrastructure=parser.extract_infrastructure(description),
-                        legal=parser.extract_legal_context(description, title),
-                        usable_area_m2=parser.extract_usable_area(title, description),
-                        land_area_m2=parser.extract_land_area(title, description),
-                        built_up_area_m2=parser.extract_built_up_area(
-                            title, description
-                        ),
-                        material=parser.extract_material(combined_text),
-                        condition=parser.extract_condition(combined_text),
-                        energy_class=parser.extract_energy_class(combined_text),
-                    )
-
-                    return input_model.materialize()
-
-                except (TimeoutError, aiohttp.ClientError) as e:
-                    if attempt == max_retries:
-                        logger.error(f"Exceeded max retries for {entity_url}: {e}")
-                        return None
-
-                    wait_seconds = 2 * attempt
-                    logger.debug(
-                        f"Network issue on {entity_url}. Backoff {wait_seconds}s "
-                        f"(attempt {attempt}/{max_retries})."
-                    )
-                    await asyncio.sleep(wait_seconds)
-
-                except (ValidationError, ValueError, TypeError, AttributeError) as e:
-                    logger.error(
-                        f"Unrecoverable parsing/validation error for {entity_url}: {e}"
-                    )
+            except (TimeoutError, aiohttp.ClientError) as e:
+                if attempt == max_retries:
+                    logger.error(f"Exceeded max retries for {entity_url}: {e}")
                     return None
 
-            return None
+                logger.debug(
+                    f"Network issue on {entity_url}: {e} "
+                    f"(attempt {attempt}/{max_retries})."
+                )
+                should_retry = True
+
+            if should_retry:
+                if attempt == max_retries:
+                    return None
+                await asyncio.sleep(2 * attempt)
+                continue
+
+            if html_content is None:
+                return None
+
+            try:
+                parser = BazosDOMParser(html_content, entity_url)
+
+                title = parser.extract_title()
+                description = parser.extract_description()
+                price, currency = parser.extract_price()
+                location = parser.extract_location()
+
+                combined_text = f"{title} {description}"
+
+                input_model = BazosInputModel(
+                    url=entity_url,
+                    raw_transaction=raw_transaction,
+                    raw_entity=raw_entity,
+                    title=title,
+                    description=description,
+                    price=price,
+                    currency=currency,
+                    location=location,
+                    postal_code=location.postal_code,
+                    infrastructure=parser.extract_infrastructure(description),
+                    legal=parser.extract_legal_context(description, title),
+                    usable_area_m2=parser.extract_usable_area(title, description),
+                    land_area_m2=parser.extract_land_area(title, description),
+                    built_up_area_m2=parser.extract_built_up_area(title, description),
+                    material=parser.extract_material(combined_text),
+                    condition=parser.extract_condition(combined_text),
+                    energy_class=parser.extract_energy_class(combined_text),
+                )
+
+                return input_model.materialize()
+
+            except (ValidationError, ValueError, TypeError, AttributeError) as e:
+                logger.error(
+                    f"Unrecoverable parsing/validation error for {entity_url}: {e}"
+                )
+                return None
+
+        return None

@@ -10,6 +10,7 @@ from src.orchestration.assets.bronze_assets import (
     bronze_bazos_listings,
     bronze_bezrealitky_listings,
 )
+from src.storage.catalog import get_catalog_manager
 from src.transformations.silver import process_silver
 
 
@@ -27,7 +28,7 @@ def silver_properties(
 ) -> MaterializeResult:
     """Executes unified Silver transformation and multi-portal entity resolution."""
     context.log.info("Initiating unified Silver layer materialization...")
-    table_id = "silver.properties"
+    table_id = get_catalog_manager().silver_table_id
 
     # Materialize unified Iceberg table across all active portal sources
     table = process_silver()
