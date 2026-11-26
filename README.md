@@ -57,7 +57,7 @@ Built with **Python 3.14**, **Apache Iceberg**, **Project Nessie**, **MinIO**, *
 ## Key Engineering Highlights
 
 * **Strict Schema Contracts:** Uses Pydantic v2 discriminated unions (`BuildingProperty` vs. `LandProperty`) at the ingestion boundary and enforces explicit PyArrow schemas (`BRONZE_PROPERTY_ARROW_SCHEMA`, `SILVER_PROPERTY_ARROW_SCHEMA`) before writing Parquet files to Apache Iceberg.
-* **Incremental Extraction & Reconciliation:** Tracks active listing IDs and historical prices in Bronze to skip unchanged pages (`fast-path`), while running concurrent `HEAD` reconciliation audits (`BazosReconciler`) to emit tombstone records for deleted ads.
+* **Incremental Extraction & Reconciliation:** Tracks active listing IDs and historical prices in Bronze to skip unchanged records (`fast-path`), while running concurrent `HEAD` reconciliation audits (`BazosReconciler`) to emit deterministic SHA-256 tombstone records for deleted ads.
 * **Cross-Portal Entity Resolution:** Identifies identical physical properties listed across multiple portals using spatial blocking keys, price/area tolerances, and vectorized Haversine GPS distance calculation in Polars.
 * **Open Table Format & Git-like Catalog:** Persists versioned Parquet datasets on S3-compatible **MinIO** managed by **Project Nessie** REST Catalog.
 
@@ -75,9 +75,12 @@ Built with **Python 3.14**, **Apache Iceberg**, **Project Nessie**, **MinIO**, *
 
 ```text
 Real-Estate-Watchdog-v2/
-├── data/static/               # Reference lookup datasets (e.g., Czech postal codes)
+├── .github/workflows/
+│   └── ci.yml                 # Automated Ruff, Mypy & Pytest CI pipeline
+├── data/static/               # Reference lookup datasets (Czech postal codes)
 ├── docker/
 │   └── docker-compose.yml     # MinIO (S3) + Project Nessie (Iceberg REST Catalog)
+├── docs/images/               # Architecture & UI documentation screenshots
 ├── src/
 │   ├── contracts/             # Pydantic v2 domain models, validators & PyArrow schemas
 │   ├── orchestration/         # Dagster assets, jobs, schedules & definitions
@@ -86,8 +89,11 @@ Real-Estate-Watchdog-v2/
 │   ├── transformations/       # Bronze ingestion, Silver normalization & Gold marts
 │   ├── config.py              # Pydantic Settings configuration
 │   ├── dashboard.py           # Streamlit analytical dashboard
-│   └── main.py                # Standalone CLI pipeline runner
+│   ├── main.py                # Standalone async CLI pipeline runner
+│   └── verify_iceberg.py      # Infrastructure & Iceberg schema verification script
+├── tests/                     # Pytest unit test suite
 ├── .env.example               # Environment configuration template
+├── .gitignore                 # Git exclusion rules
 └── pyproject.toml             # uv / PEP 621 project dependencies & tool config
 ```
 
@@ -132,4 +138,17 @@ uv run python -m src.main
 ### 5. Launch Streamlit Dashboard
 ```bash
 uv run streamlit run src/dashboard.py
+```
+
+---
+
+## Code Quality & Testing
+
+Run static analysis, type checking, formatting checks, and unit tests locally:
+
+```bash
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run mypy src tests
+uv run pytest -v
 ```

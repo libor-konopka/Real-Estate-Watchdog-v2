@@ -1,4 +1,4 @@
-name: real-estate-watchdog
+name: real-estate-watchdog-v2
 
 services:
   minio:
@@ -9,8 +9,13 @@ services:
       - MINIO_ROOT_PASSWORD=password
     ports:
       - "9000:9000" # S3 API
-      - "9001:9001" # Webové rozhraní
+      - "9001:9001" # MinIO Web Console
     command: server /data --console-address ":9001"
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     volumes:
       - minio_data:/data
 
@@ -18,18 +23,22 @@ services:
     image: amazon/aws-cli:latest
     container_name: lakehouse-minio-init
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     environment:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
       - AWS_DEFAULT_REGION=us-east-1
     entrypoint: /bin/sh -c
     command: >
-      "sleep 5 && aws --endpoint-url http://minio:9000 s3 mb s3://warehouse || true"
+      "aws --endpoint-url http://minio:9000 s3 mb s3://warehouse || true"
 
   nessie:
     image: ghcr.io/projectnessie/nessie:latest
     container_name: lakehouse-nessie
+    depends_on:
+      minio:
+        condition: service_healthy
     ports:
       - "19120:19120"
     environment:
@@ -43,5 +52,6 @@ services:
       - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
       - nessie.catalog.secrets.access-key.name=admin
       - nessie.catalog.secrets.access-key.secret=password
+
 volumes:
   minio_data:
