@@ -1,12 +1,16 @@
+import asyncio
+import itertools
+import socket
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
+import aiohttp
 import polars as pl
 import pyarrow as pa
 from loguru import logger
-from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
+from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError, RESTError
 
 from src.contracts.base import (
     ActiveListingRef,
@@ -14,10 +18,39 @@ from src.contracts.base import (
     LandProperty,
     SourcePortal,
 )
+from src.contracts.portals.bazos import BazosInputModel
+from src.contracts.portals.bezrealitky import BezrealitkyRawInput
 from src.contracts.schemas import BRONZE_PROPERTY_ARROW_SCHEMA
+from src.scrapers.bazos_scraper import BazosScraper
+from src.scrapers.bezrealitky_scraper import BezrealitkyScraper
+from src.scrapers.reconciliation import BazosReconciler
 from src.storage.catalog import get_catalog_manager
 
 BronzeInputRecord = BuildingProperty | LandProperty | dict[str, Any]
+
+_REQUIRED_TOMBSTONE_KEYS: frozenset[str] = frozenset(
+    {"id", "source_id", "url", "source", "transaction_type", "entity_type"}
+)
+
+
+class IngestionLogger(Protocol):
+    """Structural logging protocol compatible with Loguru and Dagster loggers."""
+
+    def info(self, msg: str) -> None: ...
+    def error(self, msg: str) -> None: ...
+
+
+def create_http_session_params() -> tuple[aiohttp.TCPConnector, aiohttp.ClientTimeout]:
+    """Provides tuned TCPConnector and timeout settings for async scraping."""
+    connector = aiohttp.TCPConnector(
+        resolver=aiohttp.ThreadedResolver(),
+        family=socket.AF_INET,
+        use_dns_cache=True,
+        limit=30,
+        limit_per_host=10,
+    )
+    timeout = aiohttp.ClientTimeout(total=60.0, connect=10.0, sock_read=30.0)
+    return connector, timeout
 
 
 def _serialize_domain_entity(
@@ -25,7 +58,7 @@ def _serialize_domain_entity(
     batch_id: str,
     ingested_at: datetime,
 ) -> dict[str, Any]:
-    """Converts a Pydantic domain property into a nested dict matching BRONZE_PROPERTY_ARROW_SCHEMA."""
+    """Converts a Pydantic domain property into a dict matching Bronze schema."""
     location_struct = {
         "region": prop.location.region if prop.location else None,
         "district": prop.location.district if prop.location else None,
@@ -126,7 +159,11 @@ def _serialize_tombstone_dict(
     batch_id: str,
     ingested_at: datetime,
 ) -> dict[str, Any]:
-    """Normalizes minimal tombstone dictionaries emitted by reconcilers to full Bronze schema."""
+    """Normalizes tombstone dicts to the full Bronze Arrow schema."""
+    missing = _REQUIRED_TOMBSTONE_KEYS - raw.keys()
+    if missing:
+        raise ValueError(f"Tombstone record missing required fields: {sorted(missing)}")
+
     return {
         "batch_id": batch_id,
         "ingested_at": ingested_at,
@@ -169,7 +206,7 @@ def properties_to_arrow_table(
     records: Sequence[BronzeInputRecord],
     ingestion_batch_id: str,
 ) -> pa.Table:
-    """Converts domain property models or tombstone dicts into a strictly-typed PyArrow Table."""
+    """Converts domain property models or tombstone dicts into a PyArrow Table."""
     if not records:
         return pa.Table.from_batches([], schema=BRONZE_PROPERTY_ARROW_SCHEMA)
 
@@ -194,7 +231,7 @@ def save_to_iceberg(
     source: SourcePortal,
     batch_id: str | None = None,
 ) -> int:
-    """Appends a batch of raw listings or tombstones to the portal's Bronze Iceberg table."""
+    """Appends a batch of raw listings or tombstones to the Bronze Iceberg table."""
     if not records:
         return 0
 
@@ -217,7 +254,7 @@ def _load_latest_bronze_slice(
     transaction_type: str,
     entity_type: str,
 ) -> pl.DataFrame:
-    """Reads the latest snapshot per source_id for a given portal, transaction, and entity."""
+    """Reads the latest snapshot per source_id for a portal, transaction, and entity."""
     manager = get_catalog_manager()
     catalog = manager.get_catalog()
     table_id = f"{manager.BRONZE_NAMESPACE}.{source.value}_properties"
@@ -249,7 +286,7 @@ def get_known_source_ids(
     transaction_type: str,
     entity_type: str,
 ) -> dict[str, float | None]:
-    """Returns mapping of known active source_id -> latest price for incremental scraping."""
+    """Returns mapping of known active source_id -> latest price for scraping."""
     latest_df = _load_latest_bronze_slice(source, transaction_type, entity_type)
     if latest_df.is_empty():
         return {}
@@ -266,7 +303,7 @@ def get_active_bronze_properties(
     transaction_type: str,
     entity_type: str,
 ) -> list[ActiveListingRef]:
-    """Returns lightweight references of currently active listings for HTTP reconciliation."""
+    """Returns lightweight references of active listings for HTTP reconciliation."""
     latest_df = _load_latest_bronze_slice(source, transaction_type, entity_type)
     if latest_df.is_empty():
         return []
@@ -276,3 +313,138 @@ def get_active_bronze_properties(
         ActiveListingRef(source_id=row["source_id"], url=row["url"])
         for row in active_df.select(["source_id", "url"]).to_dicts()
     ]
+
+
+async def ingest_bazos_portal(
+    session: aiohttp.ClientSession,
+    batch_id: str,
+    log: IngestionLogger | None = None,
+) -> tuple[int, int]:
+    """Runs incremental ingestion and tombstone reconciliation for Bazos."""
+    active_log = log or logger
+    source = SourcePortal.BAZOS
+    scraper = BazosScraper(session)
+    reconciler = BazosReconciler(session)
+
+    targets = list(
+        itertools.product(
+            BazosInputModel.get_supported_transactions(),
+            BazosInputModel.get_supported_entities(),
+        )
+    )
+
+    scraped_count = 0
+    deactivated_count = 0
+
+    for transaction, entity in targets:
+        tx_enum, ent_enum = BazosInputModel.resolve_enums(transaction, entity)
+
+        try:
+            known_data = get_known_source_ids(source, tx_enum.value, ent_enum.value)
+            active_log.info(
+                f"[{source.value}] Scraping {transaction}/{entity} "
+                f"(known: {len(known_data)})"
+            )
+
+            entities = [
+                item
+                async for item in scraper.scrape_section(
+                    transaction, entity, known_data
+                )
+            ]
+            if entities:
+                save_to_iceberg(entities, source=source, batch_id=batch_id)
+                scraped_count += len(entities)
+                active_log.info(
+                    f"[{source.value}] Appended {len(entities)} items "
+                    f"for {transaction}/{entity} (batch={batch_id})"
+                )
+
+            active_props = get_active_bronze_properties(
+                source, tx_enum.value, ent_enum.value
+            )
+            if active_props:
+                tombstones = await reconciler.verify_and_deactivate(
+                    active_records=active_props,
+                    transaction=tx_enum.value,
+                    entity_type=ent_enum.value,
+                )
+                if tombstones:
+                    save_to_iceberg(tombstones, source=source, batch_id=batch_id)
+                    deactivated_count += len(tombstones)
+                    active_log.info(
+                        f"[{source.value}] Deactivated {len(tombstones)} listings "
+                        f"for {transaction}/{entity} (batch={batch_id})"
+                    )
+
+        except (
+            aiohttp.ClientError,
+            RESTError,
+            ValueError,
+            RuntimeError,
+            OSError,
+        ) as exc:
+            active_log.error(f"[{source.value}] Error in {transaction}/{entity}: {exc}")
+
+        await asyncio.sleep(0.5)
+
+    return scraped_count, deactivated_count
+
+
+async def ingest_bezrealitky_portal(
+    session: aiohttp.ClientSession,
+    batch_id: str,
+    log: IngestionLogger | None = None,
+) -> int:
+    """Runs incremental GraphQL API ingestion for Bezrealitky."""
+    active_log = log or logger
+    source = SourcePortal.BEZREALITKY
+    scraper = BezrealitkyScraper(session)
+
+    targets = list(
+        itertools.product(
+            BezrealitkyRawInput.get_supported_transactions(),
+            BezrealitkyRawInput.get_supported_entities(),
+        )
+    )
+
+    scraped_count = 0
+
+    for transaction, entity in targets:
+        tx_enum, ent_enum = BezrealitkyRawInput.resolve_enums(transaction, entity)
+
+        try:
+            known_data = get_known_source_ids(source, tx_enum.value, ent_enum.value)
+            active_log.info(
+                f"[{source.value}] Scraping {transaction}/{entity} "
+                f"(known: {len(known_data)})"
+            )
+
+            entities = [
+                item
+                async for item in scraper.scrape_section(
+                    transaction=transaction,
+                    entity=entity,
+                    known_data=known_data,
+                )
+            ]
+            if entities:
+                save_to_iceberg(entities, source=source, batch_id=batch_id)
+                scraped_count += len(entities)
+                active_log.info(
+                    f"[{source.value}] Appended {len(entities)} items "
+                    f"for {transaction}/{entity} (batch={batch_id})"
+                )
+
+        except (
+            aiohttp.ClientError,
+            RESTError,
+            ValueError,
+            RuntimeError,
+            OSError,
+        ) as exc:
+            active_log.error(f"[{source.value}] Error in {transaction}/{entity}: {exc}")
+
+        await asyncio.sleep(0.5)
+
+    return scraped_count

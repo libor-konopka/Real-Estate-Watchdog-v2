@@ -2,49 +2,26 @@ from datetime import UTC, datetime
 
 import polars as pl
 from loguru import logger
-from pyiceberg.exceptions import (
-    NamespaceAlreadyExistsError,
-    NoSuchNamespaceError,
-    NoSuchTableError,
-)
+from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 from pyiceberg.table import Table
 
-from src.storage.catalog import get_catalog
+from src.storage.catalog import get_catalog_manager
 
-SILVER_NAMESPACE = "silver"
-SILVER_TABLE_NAME = "properties"
-GOLD_NAMESPACE = "gold"
-GOLD_METRICS_TABLE = "market_metrics"
-GOLD_OPPORTUNITIES_TABLE = "investment_opportunities"
+# Filters out placeholder/symbolic prices (e.g., "1 Kč") that skew market benchmarks
+DEFAULT_MIN_VALID_PRICE_CZK: float = 1_000.0
 
 
 def _save_gold_table(
     df: pl.DataFrame,
-    table_name: str,
+    table_identifier: str,
 ) -> Table | None:
-    """Safely converts Polars DataFrame to Arrow and atomically overwrites Iceberg Gold table."""
+    """Converts Polars DataFrame to Arrow and overwrites Iceberg Gold table."""
     if df.is_empty():
-        logger.warning(f"DataFrame for {table_name} is empty. Skipped writing.")
+        logger.warning(f"DataFrame for {table_identifier} is empty. Skipped writing.")
         return None
 
-    catalog = get_catalog()
-    table_identifier = f"{GOLD_NAMESPACE}.{table_name}"
-    arrow_table = df.to_arrow()
-
-    try:
-        catalog.create_namespace(GOLD_NAMESPACE)
-    except NamespaceAlreadyExistsError:
-        pass
-
-    try:
-        table = catalog.load_table(table_identifier)
-        table.overwrite(arrow_table)
-    except NoSuchTableError:
-        table = catalog.create_table(
-            identifier=table_identifier,
-            schema=arrow_table.schema,
-        )
-        table.append(arrow_table)
+    manager = get_catalog_manager()
+    table = manager.overwrite_or_create_table(table_identifier, df.to_arrow())
 
     logger.info(
         f"Gold table successfully updated: {table_identifier} ({df.height} records)"
@@ -52,17 +29,19 @@ def _save_gold_table(
     return table
 
 
-def compute_market_metrics(df: pl.DataFrame) -> pl.DataFrame:
+def compute_market_metrics(
+    df: pl.DataFrame,
+    min_valid_price: float = DEFAULT_MIN_VALID_PRICE_CZK,
+) -> pl.DataFrame:
     """Aggregates market indicators (medians, averages, days on market)
 
     grouped by administrative boundaries and property segments.
     """
     now_utc = datetime.now(UTC)
 
-    # 1. Filter out records missing vital analytical metrics
     valid_df = df.filter(
         pl.col("price").is_not_null()
-        & (pl.col("price") > 0)
+        & (pl.col("price") >= min_valid_price)
         & pl.col("region").is_not_null()
         & pl.col("district").is_not_null()
     )
@@ -70,7 +49,6 @@ def compute_market_metrics(df: pl.DataFrame) -> pl.DataFrame:
     if valid_df.is_empty():
         return pl.DataFrame()
 
-    # 2. Compute Days on Market (DOM) metric per listing
     staged_df = valid_df.with_columns(
         (
             (pl.col("last_seen_at") - pl.col("first_seen_at"))
@@ -81,8 +59,6 @@ def compute_market_metrics(df: pl.DataFrame) -> pl.DataFrame:
         .alias("days_on_market")
     )
 
-    # 3. Vectorized aggregation across market segments
-    # Cast count/sum metrics from UInt32 to signed Int32 to match Apache Iceberg IntegerType
     grouping_keys = [
         "region",
         "district",
@@ -119,14 +95,16 @@ def compute_investment_opportunities(
     df: pl.DataFrame,
     min_discount_pct: float = 20.0,
     min_segment_sample_size: int = 5,
+    min_valid_price: float = DEFAULT_MIN_VALID_PRICE_CZK,
 ) -> pl.DataFrame:
     """Identifies undervalued active listings by comparing price_per_m2
 
     against the local benchmark median using analytical window expressions.
     """
-    # Analyze active building and land assets with measurable price and area
     active_candidates = df.filter(
         pl.col("is_active")
+        & pl.col("price").is_not_null()
+        & (pl.col("price") >= min_valid_price)
         & pl.col("price_per_m2").is_not_null()
         & (pl.col("price_per_m2") > 0)
         & pl.col("district").is_not_null()
@@ -137,7 +115,6 @@ def compute_investment_opportunities(
 
     segment_partition = ["district", "transaction_type", "entity_type"]
 
-    # Calculate benchmark metrics per micro-segment using window expressions
     enriched = active_candidates.with_columns(
         pl.len().over(segment_partition).cast(pl.Int32).alias("segment_sample_size"),
         pl.col("price_per_m2")
@@ -146,12 +123,10 @@ def compute_investment_opportunities(
         .alias("segment_median_price_m2"),
     )
 
-    # Filter out segments with insufficient statistical confidence
     statistically_valid = enriched.filter(
         pl.col("segment_sample_size") >= min_segment_sample_size
     )
 
-    # Calculate discount percentage relative to the segment median
     opportunities = (
         statistically_valid.with_columns(
             (
@@ -196,8 +171,9 @@ def process_gold() -> tuple[Table | None, Table | None]:
     Reads unified Silver Iceberg table, computes market aggregates and
     investment opportunities, and atomically materializes them to Gold tables.
     """
-    catalog = get_catalog()
-    silver_identifier = f"{SILVER_NAMESPACE}.{SILVER_TABLE_NAME}"
+    manager = get_catalog_manager()
+    catalog = manager.get_catalog()
+    silver_identifier = manager.silver_table_id
 
     try:
         silver_table = catalog.load_table(silver_identifier)
@@ -209,14 +185,12 @@ def process_gold() -> tuple[Table | None, Table | None]:
             )
             return None, None
 
-        # 1. Compute and materialize market metrics
         metrics_df = compute_market_metrics(silver_df)
-        metrics_table = _save_gold_table(metrics_df, GOLD_METRICS_TABLE)
+        metrics_table = _save_gold_table(metrics_df, manager.gold_metrics_table_id)
 
-        # 2. Compute and materialize bargain investment opportunities
         opportunities_df = compute_investment_opportunities(silver_df)
         opportunities_table = _save_gold_table(
-            opportunities_df, GOLD_OPPORTUNITIES_TABLE
+            opportunities_df, manager.gold_opportunities_table_id
         )
 
         return metrics_table, opportunities_table

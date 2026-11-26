@@ -8,19 +8,19 @@ from src.contracts.portals.bezrealitky import BezrealitkyRawInput
 
 
 class BezrealitkyParser:
-    """Translates raw JSON objects from Bezrealitky GraphQL API into validated domain models."""
+    """Translates raw JSON objects from Bezrealitky GraphQL into domain models."""
 
     @staticmethod
     def parse_advert(
         raw: dict[str, Any],
     ) -> BuildingProperty | LandProperty | None:
-        """Parses a single Advert object from GraphQL list into a materialized domain property."""
+        """Parses a single Advert object into a materialized domain property."""
         try:
-            source_id = str(raw.get("id"))
-            if not source_id:
+            raw_id = raw.get("id")
+            if raw_id is None or not str(raw_id).strip():
                 return None
+            source_id = str(raw_id).strip()
 
-            # Spatial coordinates extraction
             gps_data = raw.get("gps") or {}
             latitude = (
                 float(gps_data["lat"]) if gps_data.get("lat") is not None else None
@@ -29,7 +29,6 @@ class BezrealitkyParser:
                 float(gps_data["lng"]) if gps_data.get("lng") is not None else None
             )
 
-            # Raw input validation boundary instantiation
             raw_input = BezrealitkyRawInput(
                 source_id=source_id,
                 uri=raw.get("uri") or f"inzerat/{source_id}",

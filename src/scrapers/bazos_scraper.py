@@ -54,16 +54,12 @@ class BazosScraper:
         max_pages: int = 25,
         max_consecutive_known: int = 2,
     ) -> AsyncGenerator[BuildingProperty | LandProperty]:
-        """Asynchronously scrapes a section, yielding new or price-updated properties.
-
-        Stops pagination early if consecutive pages yield no new or updated records.
-        """
+        """Asynchronously scrapes a section, yielding new or updated properties."""
         known_records = known_data or {}
         consecutive_fully_known_pages = 0
 
         for page in range(max_pages):
             offset = page * self.PAGE_SIZE
-            # First page uses canonical path, subsequent pages append the offset
             section_url = (
                 f"{self.base_url}/{transaction}/{entity}/"
                 if offset == 0
@@ -73,38 +69,35 @@ class BazosScraper:
             cards = await self._fetch_catalog_page(section_url)
             if not cards:
                 logger.info(
-                    f"No more listings found on page {page + 1} for {transaction}/{entity}."
+                    f"No more listings found on page {page + 1} "
+                    f"for {transaction}/{entity}."
                 )
                 break
 
-            # Fast-path incremental check: identify listings that need detail fetching
             cards_to_fetch: list[BazosListingCard] = []
             for card in cards:
                 if card.source_id in known_records:
                     previous_price = known_records[card.source_id]
-                    # Skip if price is unchanged and listing is already recorded
                     if card.price == previous_price:
                         continue
                 cards_to_fetch.append(card)
 
             logger.debug(
-                f"Page {page + 1} ({transaction}/{entity}): {len(cards_to_fetch)}/{len(cards)} "
-                "listings need extraction."
+                f"Page {page + 1} ({transaction}/{entity}): "
+                f"{len(cards_to_fetch)}/{len(cards)} listings need extraction."
             )
 
-            # Early stopping mechanism: if entire pages are already known, avoid scraping deeper
             if not cards_to_fetch:
                 consecutive_fully_known_pages += 1
                 if consecutive_fully_known_pages >= max_consecutive_known:
                     logger.info(
-                        f"Early stopping triggered for {transaction}/{entity} "
-                        f"after {consecutive_fully_known_pages} consecutive known pages."
+                        f"Early stopping triggered for {transaction}/{entity} after "
+                        f"{consecutive_fully_known_pages} consecutive known pages."
                     )
                     break
             else:
                 consecutive_fully_known_pages = 0
 
-                # Fetch and parse details concurrently under the semaphore ceiling
                 tasks = [
                     self._process_detail(card.url, transaction, entity)
                     for card in cards_to_fetch
@@ -115,7 +108,6 @@ class BazosScraper:
                     if property_entity is not None:
                         yield property_entity
 
-            # Courtesy delay between catalog pages to avoid triggering rate limits
             await asyncio.sleep(self._request_delay)
 
     async def _fetch_catalog_page(self, url: str) -> list[BazosListingCard]:
@@ -127,7 +119,7 @@ class BazosScraper:
                         f"Catalog page returned status {response.status}: {url}"
                     )
                     return []
-                html = await response.text(encoding="utf-8")
+                html = await response.text(encoding="utf-8", errors="replace")
                 return BazosDOMParser.parse_catalog_page(html, self.base_url)
         except (TimeoutError, aiohttp.ClientError) as e:
             logger.error(f"Network error while fetching catalog {url}: {e}")
@@ -149,11 +141,14 @@ class BazosScraper:
                     ) as response:
                         if response.status != 200:
                             logger.warning(
-                                f"Failed to fetch detail (status {response.status}): {entity_url}"
+                                f"Failed to fetch detail (status {response.status}): "
+                                f"{entity_url}"
                             )
                             return None
 
-                        html_content = await response.text(encoding="utf-8")
+                        html_content = await response.text(
+                            encoding="utf-8", errors="replace"
+                        )
 
                     parser = BazosDOMParser(html_content, entity_url)
 

@@ -1,7 +1,9 @@
+import contextlib
 import os
 from functools import lru_cache
 from typing import Any
 
+import pyarrow as pa
 from loguru import logger
 from pyiceberg.catalog import Catalog, load_catalog
 from pyiceberg.exceptions import (
@@ -20,23 +22,45 @@ from src.contracts.schemas import (
 
 
 class IcebergCatalogManager:
-    """Manages Apache Iceberg catalog connections via Project Nessie and S3/MinIO storage.
+    """Manages Apache Iceberg catalog connections via Project Nessie and MinIO.
 
-    Handles namespace initialization and schema mapping across Medallion layers
-    (bronze, silver, gold).
+    Centralizes namespace initialization, table identifiers, and schema mapping
+    across Medallion layers (bronze, silver, gold).
     """
 
     BRONZE_NAMESPACE: str = "bronze"
     SILVER_NAMESPACE: str = "silver"
     GOLD_NAMESPACE: str = "gold"
+
     UNIFIED_SILVER_TABLE: str = "properties"
+    GOLD_METRICS_TABLE: str = "market_metrics"
+    GOLD_OPPORTUNITIES_TABLE: str = "investment_opportunities"
 
     def __init__(self) -> None:
         self.settings = get_storage_settings()
         self._catalog: Catalog | None = None
 
+    @property
+    def silver_table_id(self) -> str:
+        """Returns fully qualified unified Silver table identifier."""
+        return f"{self.SILVER_NAMESPACE}.{self.UNIFIED_SILVER_TABLE}"
+
+    @property
+    def gold_metrics_table_id(self) -> str:
+        """Returns fully qualified Gold market metrics table identifier."""
+        return f"{self.GOLD_NAMESPACE}.{self.GOLD_METRICS_TABLE}"
+
+    @property
+    def gold_opportunities_table_id(self) -> str:
+        """Returns fully qualified Gold investment opportunities table identifier."""
+        return f"{self.GOLD_NAMESPACE}.{self.GOLD_OPPORTUNITIES_TABLE}"
+
+    def bronze_table_id(self, source: SourcePortal) -> str:
+        """Returns fully qualified Bronze table identifier for a given portal."""
+        return f"{self.BRONZE_NAMESPACE}.{source.value}_properties"
+
     def _export_s3_env(self) -> None:
-        """Exports S3 credentials to process environment and disables AWS EC2 IMDS probing."""
+        """Exports S3 credentials to environment and disables EC2 IMDS probing."""
         os.environ.setdefault("AWS_ACCESS_KEY_ID", self.settings.aws_access_key_id)
         os.environ.setdefault(
             "AWS_SECRET_ACCESS_KEY",
@@ -48,11 +72,14 @@ class IcebergCatalogManager:
         os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
 
     def get_catalog(self) -> Catalog:
-        """Initializes and returns cached PyIceberg REST catalog connected to Nessie and MinIO."""
+        """Initializes and returns cached PyIceberg REST catalog."""
         if self._catalog is not None:
             return self._catalog
 
         self._export_s3_env()
+        ssl_enabled = str(
+            self.settings.aws_endpoint_url.lower().startswith("https://")
+        ).lower()
 
         catalog_properties: dict[str, Any] = {
             "type": "rest",
@@ -64,12 +91,13 @@ class IcebergCatalogManager:
             ),
             "s3.region": self.settings.aws_region,
             "s3.path-style-access": str(self.settings.s3_path_style_access).lower(),
-            "s3.ssl.enabled": "false",
+            "s3.ssl.enabled": ssl_enabled,
             "warehouse": self.settings.iceberg_warehouse,
         }
 
         logger.info(
-            f"Connecting to Iceberg REST catalog at {self.settings.iceberg_catalog_uri}..."
+            f"Connecting to Iceberg REST catalog at "
+            f"{self.settings.iceberg_catalog_uri}..."
         )
         self._catalog = load_catalog("nessie", **catalog_properties)
         self._ensure_medallion_namespaces()
@@ -92,19 +120,21 @@ class IcebergCatalogManager:
                 logger.debug(f"Iceberg namespace '{ns}' already exists.")
             except RESTError as exc:
                 logger.warning(
-                    f"Namespace verification for '{ns}' returned non-critical status: {exc}"
+                    f"Namespace verification for '{ns}' returned non-critical "
+                    f"status: {exc}"
                 )
 
     def get_or_create_bronze_table(self, source: SourcePortal) -> Table:
-        """Loads existing portal Bronze table or creates it using BRONZE_PROPERTY_ARROW_SCHEMA."""
+        """Loads existing Bronze table or initializes it with Bronze schema."""
         catalog = self.get_catalog()
-        table_identifier = f"{self.BRONZE_NAMESPACE}.{source.value}_properties"
+        table_identifier = self.bronze_table_id(source)
 
         try:
             return catalog.load_table(table_identifier)
         except NoSuchTableError:
             logger.info(
-                f"Table '{table_identifier}' does not exist. Initializing with Bronze schema..."
+                f"Table '{table_identifier}' does not exist. "
+                "Initializing with Bronze schema..."
             )
             return catalog.create_table(
                 identifier=table_identifier,
@@ -112,20 +142,45 @@ class IcebergCatalogManager:
             )
 
     def get_or_create_silver_table(self) -> Table:
-        """Loads existing unified Silver table or creates it using SILVER_PROPERTY_ARROW_SCHEMA."""
+        """Loads existing Silver table or initializes it with Silver schema."""
         catalog = self.get_catalog()
-        table_identifier = f"{self.SILVER_NAMESPACE}.{self.UNIFIED_SILVER_TABLE}"
+        table_identifier = self.silver_table_id
 
         try:
             return catalog.load_table(table_identifier)
         except NoSuchTableError:
             logger.info(
-                f"Table '{table_identifier}' does not exist. Initializing with Silver schema..."
+                f"Table '{table_identifier}' does not exist. "
+                "Initializing with Silver schema..."
             )
             return catalog.create_table(
                 identifier=table_identifier,
                 schema=SILVER_PROPERTY_ARROW_SCHEMA,
             )
+
+    def overwrite_or_create_table(
+        self,
+        table_identifier: str,
+        arrow_table: pa.Table,
+    ) -> Table:
+        """Atomically overwrites an Iceberg table or creates it from Arrow schema."""
+        catalog = self.get_catalog()
+        namespace = table_identifier.split(".", maxsplit=1)[0]
+
+        with contextlib.suppress(NamespaceAlreadyExistsError):
+            catalog.create_namespace(namespace)
+
+        try:
+            table = catalog.load_table(table_identifier)
+            table.overwrite(arrow_table)
+        except NoSuchTableError:
+            table = catalog.create_table(
+                identifier=table_identifier,
+                schema=arrow_table.schema,
+            )
+            table.append(arrow_table)
+
+        return table
 
 
 @lru_cache(maxsize=1)

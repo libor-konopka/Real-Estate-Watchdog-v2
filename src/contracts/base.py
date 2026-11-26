@@ -59,8 +59,8 @@ class Currency(StrEnum):
 class GPSCoordinates(BaseModel):
     """Exact spatial point anchored by latitude and longitude."""
 
-    lat: float
-    lon: float
+    lat: float = Field(ge=-90.0, le=90.0)
+    lon: float = Field(ge=-180.0, le=180.0)
 
 
 class Location(BaseModel):
@@ -164,7 +164,7 @@ class BaseProperty(BaseModel):
     entity_type: EntityType
 
     # Financial details
-    price: float | None = None
+    price: float | None = Field(default=None, ge=0.0)
     currency: Currency | None = None
 
     # Time anchor (requires timezone-aware timestamp)
@@ -176,8 +176,8 @@ class BaseProperty(BaseModel):
     legal: LegalContext | None = None
 
     # Dimensions
-    land_area_m2: float | None = None
-    usable_area_m2: float | None = None
+    land_area_m2: float | None = Field(default=None, ge=0.0)
+    usable_area_m2: float | None = Field(default=None, ge=0.0)
     description: str | None = None
 
 
@@ -191,7 +191,7 @@ class BuildingProperty(BaseProperty):
         EntityType.OTHER,
     ]
 
-    built_up_area_m2: float | None = None
+    built_up_area_m2: float | None = Field(default=None, ge=0.0)
     material: BuildingMaterial | None = None
     condition: BuildingCondition | None = None
     energy_class: EnergyClass | None = None
@@ -214,11 +214,8 @@ PropertyListing = Annotated[
     Field(discriminator="entity_type"),
 ]
 
-# High-performance TypeAdapter for validating single records or batches
+# High-performance TypeAdapter for validating single records
 property_listing_adapter: TypeAdapter[PropertyListing] = TypeAdapter(PropertyListing)
-property_listing_list_adapter: TypeAdapter[list[PropertyListing]] = TypeAdapter(
-    list[PropertyListing]
-)
 
 
 @dataclass(slots=True, frozen=True)

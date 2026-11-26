@@ -87,7 +87,7 @@ DISTRICT_TO_REGION = {
 
 @lru_cache(maxsize=1)
 def load_geo_lookup_df() -> pl.DataFrame:
-    """Loads postal codes lookup and returns a Polars DataFrame with normalized columns."""
+    """Loads postal code lookup and returns a normalized Polars DataFrame."""
     current_dir = Path(__file__).resolve().parent
     project_root = current_dir.parent.parent
     file_path = project_root / "data" / "static" / "psc_kraje.csv"

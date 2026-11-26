@@ -43,11 +43,10 @@ class BazosDOMParser:
     def parse_catalog_page(
         html_content: str, base_url: str = "https://reality.bazos.cz"
     ) -> list[BazosListingCard]:
-        """Extracts listing cards from a pagination catalog page in a single pass."""
+        """Extracts listing cards from a catalog page in a single pass."""
         tree = HTMLParser(html_content)
         cards: list[BazosListingCard] = []
 
-        # Iterate over all listing containers in the search result
         for container in tree.css("div.inzeraty"):
             link_node = container.css_first("h2.nadpis a, span.nadpis a")
             if not link_node:
@@ -111,16 +110,21 @@ class BazosDOMParser:
         )
 
     def extract_location(self) -> Location:
-        """Extracts location and correctly sets postal_code within the domain model."""
+        """Extracts location and normalizes empty strings to None."""
         raw_loc = self._table_data.get("lokalita", "").replace("\xa0", " ").strip()
+        if not raw_loc:
+            return Location()
+
         postal_code: str | None = None
-        municipality: str | None = raw_loc
+        municipality: str | None = None
 
         if match := patterns.RE_LOCATION.match(raw_loc):
             if match.group(1):
                 postal_code = match.group(1).replace(" ", "")
-            if match.group(2):
+            if match.group(2) and match.group(2).strip():
                 municipality = match.group(2).strip()
+        else:
+            municipality = raw_loc
 
         return Location(
             region=None,
@@ -220,38 +224,40 @@ class BazosDOMParser:
             if not text:
                 continue
             match = (
-                patterns.RE_USABLE_AREA_FWD.search(text)
+                patterns.RE_USABLE_AREA_STRUCT.search(text)
+                or patterns.RE_USABLE_AREA_FWD.search(text)
                 or patterns.RE_USABLE_AREA_REV.search(text)
-                or patterns.RE_USABLE_AREA_STRUCT.search(text)
             )
             if match:
                 clean_num = re.sub(r"\s+", "", match.group(1)).replace(",", ".")
                 try:
-                    return float(clean_num)
+                    value = float(clean_num)
+                    if value > 0:
+                        return value
                 except ValueError:
                     pass
         return None
 
     def extract_land_area(self, title: str, desc: str) -> float | None:
-        total = 0.0
-        found = False
+        """
+        Extracts land area, prioritizing structured labels without double-counting.
+        """
         for text in (desc, title):
             if not text:
                 continue
             for pattern in (
+                patterns.RE_LAND_AREA_STRUCT,
                 patterns.RE_LAND_AREA_FWD,
                 patterns.RE_LAND_AREA_REV,
-                patterns.RE_LAND_AREA_STRUCT,
             ):
-                for match in pattern.finditer(text):
+                if match := pattern.search(text):
                     clean_num = re.sub(r"\s+", "", match.group(1)).replace(",", ".")
                     try:
-                        total += float(clean_num)
-                        found = True
+                        value = float(clean_num)
+                        if value > 0:
+                            return value
                     except ValueError:
-                        pass
-                if found:
-                    return total
+                        continue
         return None
 
     def extract_built_up_area(self, title: str, desc: str) -> float | None:
@@ -259,13 +265,15 @@ class BazosDOMParser:
             if not text:
                 continue
             if match := (
-                patterns.RE_BUILT_UP_AREA_FWD.search(text)
+                patterns.RE_BUILT_UP_AREA_STRUCT.search(text)
+                or patterns.RE_BUILT_UP_AREA_FWD.search(text)
                 or patterns.RE_BUILT_UP_AREA_REV.search(text)
-                or patterns.RE_BUILT_UP_AREA_STRUCT.search(text)
             ):
                 clean_num = re.sub(r"\s+", "", match.group(1)).replace(",", ".")
                 try:
-                    return float(clean_num)
+                    value = float(clean_num)
+                    if value > 0:
+                        return value
                 except ValueError:
                     pass
         return None

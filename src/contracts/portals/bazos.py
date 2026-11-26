@@ -1,6 +1,4 @@
-import hashlib
 import re
-from datetime import UTC, datetime
 from typing import ClassVar
 
 from pydantic import HttpUrl
@@ -16,10 +14,11 @@ from src.contracts.base import (
     LandProperty,
     LegalContext,
     Location,
+    PropertyListing,
     SourcePortal,
     TransactionType,
 )
-from src.contracts.portals.base import AnyProperty, BasePortalInput
+from src.contracts.portals.base import BasePortalInput
 
 
 class BazosInputModel(BasePortalInput):
@@ -76,6 +75,17 @@ class BazosInputModel(BasePortalInput):
         """Returns list of supported URL entity slugs."""
         return list(cls._ENTITY_MAP.keys())
 
+    @classmethod
+    def resolve_enums(
+        cls, transaction: str, entity: str
+    ) -> tuple[TransactionType, EntityType]:
+        """Resolves URL transaction and entity slugs into domain enums."""
+        if transaction not in cls._TRANSACTION_MAP:
+            raise ValueError(f"Unsupported Bazos transaction slug: {transaction}")
+        if entity not in cls._ENTITY_MAP:
+            raise ValueError(f"Unsupported Bazos entity slug: {entity}")
+        return cls._TRANSACTION_MAP[transaction], cls._ENTITY_MAP[entity]
+
     def _extract_source_id(self) -> str:
         """Extracts numeric advertisement ID from Bazos URL path."""
         match = re.search(r"/inzerat/(\d+)/", self.url) or re.search(
@@ -83,17 +93,12 @@ class BazosInputModel(BasePortalInput):
         )
         if match:
             return match.group(1)
-        # Fallback to deterministic hash if numeric pattern is absent
-        return hashlib.md5(self.url.encode()).hexdigest()[:10]
+        return self._generate_id(self.url)[:12]
 
-    def materialize(self) -> AnyProperty:
-        """Converts raw validated input into domain BuildingProperty or LandProperty."""
+    def materialize(self) -> PropertyListing:
+        """Converts raw validated input into BuildingProperty or LandProperty."""
         source_id = self._extract_source_id()
-
-        # Deterministic Lakehouse entity ID: sha256(bazos_<source_id>)
-        entity_id = hashlib.sha256(
-            f"{SourcePortal.BAZOS.value}_{source_id}".encode()
-        ).hexdigest()
+        entity_id = self.generate_entity_id(SourcePortal.BAZOS, source_id)
 
         transaction_enum = self._TRANSACTION_MAP.get(
             self.raw_transaction, TransactionType.SALE
@@ -106,14 +111,13 @@ class BazosInputModel(BasePortalInput):
             else Currency.CZK
         )
 
-        # Ensure location object retains postal code if provided separately
         loc = self.location or Location()
         if self.postal_code and not loc.postal_code:
             loc = loc.model_copy(update={"postal_code": self.postal_code})
 
         title = self.title or "Bazoš inzerát"
         listing_url = HttpUrl(self.url)
-        scraped_at = datetime.now(UTC)
+        scraped_at = self._get_utc_now()
 
         if entity_enum == EntityType.LAND:
             return LandProperty(

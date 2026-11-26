@@ -1,44 +1,33 @@
 import hashlib
 from abc import ABC, abstractmethod
-from datetime import datetime
-from typing import Annotated
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-# Core entities import
-from src.contracts.base import BuildingProperty, LandProperty
-
-# Unified type for dynamic materialization
-AnyProperty = Annotated[
-    BuildingProperty | LandProperty, Field(discriminator="entity_type")
-]
+from src.contracts.base import PropertyListing, SourcePortal
 
 
 class BasePortalInput(BaseModel, ABC):
-    """
-    Abstract foundational membrane for all external data sources.
-    Provides shared alchemical tools for identity and time anchoring.
+    """Abstract base boundary model for external portal ingestion payloads.
+
+    Provides deterministic SHA-256 identity generation and UTC timestamp helpers.
     """
 
     @staticmethod
     def _generate_id(source_string: str) -> str:
-        """
-        Generates a deterministic SHA-256 hash to anchor the entity's identity.
-        Ensures perfect deduplication across the Lakehouse.
-        """
+        """Generates a deterministic SHA-256 hex digest from an arbitrary string."""
         return hashlib.sha256(source_string.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def generate_entity_id(cls, source: SourcePortal, source_id: str) -> str:
+        """Generates the canonical Lakehouse entity ID for a portal listing."""
+        return cls._generate_id(f"{source.value}_{source_id}")
 
     @staticmethod
     def _get_utc_now() -> datetime:
-        """
-        Captures the absolute current time in UTC, free from local illusions.
-        """
-        return datetime.now(ZoneInfo("UTC"))
+        """Returns the current timezone-aware UTC timestamp."""
+        return datetime.now(UTC)
 
     @abstractmethod
-    def materialize(self) -> AnyProperty:
-        """
-        Alchemical process: converts the sanitized bronze mass into the strict core property.
-        Must be implemented by every specific portal membrane.
-        """
+    def materialize(self) -> PropertyListing:
+        """Validates and converts raw portal input into an immutable domain model."""

@@ -8,14 +8,14 @@ from pyiceberg.exceptions import (
     RESTError,
 )
 
-from src.storage.catalog import get_catalog
+from src.storage.catalog import get_catalog_manager
 
 
 @st.cache_data(ttl=60)
 def load_iceberg_table(table_identifier: str) -> pl.DataFrame:
     """Reads an Apache Iceberg table into a Polars DataFrame via Nessie REST catalog."""
     try:
-        catalog = get_catalog()
+        catalog = get_catalog_manager().get_catalog()
         table = catalog.load_table(table_identifier)
         df = cast(pl.DataFrame, pl.scan_iceberg(table).collect())
 
@@ -103,7 +103,8 @@ def render_investment_opportunities(opps_df: pl.DataFrame) -> None:
 
     if opps_df.is_empty():
         st.info(
-            "Zatím nebyly detekovány žádné podhodnocené nabídky v `gold.investment_opportunities`."
+            "Zatím nebyly detekovány žádné podhodnocené nabídky v "
+            "`gold.investment_opportunities`."
         )
         return
 
@@ -192,8 +193,7 @@ def render_silver_explorer(silver_df: pl.DataFrame) -> None:
         filtered = filtered.filter(pl.col("is_active"))
 
     if deduplicate_cross_portal and "canonical_property_id" in filtered.columns:
-        sort_col = "scraped_at" if "scraped_at" in filtered.columns else "last_seen_at"
-        filtered = filtered.sort(sort_col).unique(
+        filtered = filtered.sort("last_seen_at").unique(
             subset=["canonical_property_id"], keep="last"
         )
 
@@ -246,9 +246,10 @@ def main() -> None:
     st.set_page_config(page_title="Real-Estate Watchdog", layout="wide")
     st.title("Real-Estate Watchdog — Medallion Lakehouse Explorer")
 
-    silver_df = load_iceberg_table("silver.properties")
-    metrics_df = load_iceberg_table("gold.market_metrics")
-    opps_df = load_iceberg_table("gold.investment_opportunities")
+    manager = get_catalog_manager()
+    silver_df = load_iceberg_table(manager.silver_table_id)
+    metrics_df = load_iceberg_table(manager.gold_metrics_table_id)
+    opps_df = load_iceberg_table(manager.gold_opportunities_table_id)
 
     tab_silver, tab_opps, tab_market = st.tabs(
         [

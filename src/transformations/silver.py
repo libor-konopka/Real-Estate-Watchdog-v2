@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import math
 
@@ -49,7 +50,7 @@ def haversine_distance_expr(
 
 
 def generate_blocking_key(df: pl.DataFrame) -> pl.DataFrame:
-    """Generates coarse partition keys to drastically narrow pairwise comparison space."""
+    """Generates coarse partition keys to narrow pairwise comparison space."""
     area_bucket = (
         (pl.coalesce(["usable_area_m2", "land_area_m2"]).fill_null(0.0) / 10.0)
         .round(0)
@@ -57,7 +58,9 @@ def generate_blocking_key(df: pl.DataFrame) -> pl.DataFrame:
         .cast(pl.String)
     )
 
-    clean_municipality = pl.col("municipality").fill_null("unknown").str.to_lowercase()
+    clean_municipality = (
+        pl.col("municipality").cast(pl.String).fill_null("unknown").str.to_lowercase()
+    )
 
     return df.with_columns(
         pl.concat_str(
@@ -78,7 +81,7 @@ def match_cross_portal_duplicates(
     max_price_diff_ratio: float = 0.12,
     max_area_diff_m2: float = 4.0,
 ) -> pl.DataFrame:
-    """Identifies identical properties across portals within blocks and assigns canonical_property_id."""
+    """Identifies identical properties across portals and assigns canonical ID."""
     if df.is_empty():
         return df.with_columns(
             pl.lit(None).cast(pl.String).alias("canonical_property_id")
@@ -89,6 +92,7 @@ def match_cross_portal_duplicates(
     candidate_cols = [
         "id",
         "source",
+        "municipality",
         "blocking_key",
         "price",
         "usable_area_m2",
@@ -118,10 +122,18 @@ def match_cross_portal_duplicates(
     price_diff_ratio = (pl.col("price") - pl.col("price_match")).abs() / (
         pl.coalesce([pl.col("price"), pl.lit(1.0)])
     )
-    price_condition = price_diff_ratio <= max_price_diff_ratio
+    price_condition = (
+        pl.col("price").is_not_null()
+        & pl.col("price_match").is_not_null()
+        & (price_diff_ratio <= max_price_diff_ratio)
+    )
 
     area_delta = (pl.col("usable_area_m2") - pl.col("usable_area_m2_match")).abs()
-    area_condition = area_delta <= max_area_diff_m2
+    area_condition = (
+        pl.col("usable_area_m2").is_not_null()
+        & pl.col("usable_area_m2_match").is_not_null()
+        & (area_delta <= max_area_diff_m2)
+    )
 
     has_gps = (
         pl.col("latitude").is_not_null()
@@ -130,19 +142,34 @@ def match_cross_portal_duplicates(
         & pl.col("longitude_match").is_not_null()
     )
 
+    normalized_municipality = pl.col("municipality").cast(pl.String).str.to_lowercase()
+    has_known_municipality = normalized_municipality.is_not_null() & (
+        normalized_municipality != "unknown"
+    )
+
     distance_expr = haversine_distance_expr(
         "latitude", "longitude", "latitude_match", "longitude_match"
     )
 
     spatial_condition = (has_gps & (distance_expr <= max_distance_meters)) | (
-        (~has_gps) & price_condition & area_condition
+        (~has_gps) & has_known_municipality & price_condition & area_condition
     )
 
-    matched_pairs = candidates.filter(
-        price_condition & area_condition & spatial_condition
-    ).select(
-        pl.col("id_match").alias("matched_id"),
-        pl.col("id").alias("canonical_id"),
+    matched_pairs = (
+        candidates.filter(price_condition & area_condition & spatial_condition)
+        .with_columns(
+            pl.when(has_gps)
+            .then(distance_expr)
+            .otherwise(pl.lit(float("inf")))
+            .alias("_match_distance"),
+            price_diff_ratio.alias("_price_diff_ratio"),
+        )
+        .sort(["_match_distance", "_price_diff_ratio", "id"])
+        .unique(subset=["id_match"], keep="first")
+        .select(
+            pl.col("id_match").alias("matched_id"),
+            pl.col("id").alias("canonical_id"),
+        )
     )
 
     return (
@@ -242,20 +269,50 @@ def compute_derived_metrics(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def calculate_lifecycle_and_deduplicate(df: pl.DataFrame) -> pl.DataFrame:
-    """Computes lifecycle timestamps per listing and keeps strictly the latest snapshot."""
-    return (
-        df.with_columns(
-            pl.col("scraped_at")
-            .min()
-            .over(["source", "source_id"])
-            .alias("first_seen_at"),
-            pl.col("scraped_at")
-            .max()
-            .over(["source", "source_id"])
-            .alias("last_seen_at"),
+    """Computes lifecycle timestamps, preserves attributes across tombstones,
+
+    and keeps the latest snapshot per listing.
+    """
+    excluded_cols = {
+        "source",
+        "source_id",
+        "is_active",
+        "scraped_at",
+        "batch_id",
+        "ingested_at",
+        "first_seen_at",
+        "last_seen_at",
+    }
+    fillable_cols = [col for col in df.columns if col not in excluded_cols]
+
+    staged = df.sort(["source", "source_id", "scraped_at"]).with_columns(
+        pl.col("scraped_at").min().over(["source", "source_id"]).alias("first_seen_at"),
+        pl.col("scraped_at").max().over(["source", "source_id"]).alias("last_seen_at"),
+    )
+
+    if "title" in staged.columns:
+        staged = staged.with_columns(
+            pl.when(pl.col("title") == "[DEACTIVATED]")
+            .then(None)
+            .otherwise(pl.col("title"))
+            .alias("title")
         )
-        .sort("scraped_at")
-        .unique(subset=["source", "source_id"], keep="last")
+
+    if fillable_cols:
+        staged = staged.with_columns(
+            [
+                pl.col(col).forward_fill().over(["source", "source_id"])
+                for col in fillable_cols
+            ]
+        )
+
+    if "title" in staged.columns:
+        staged = staged.with_columns(pl.col("title").fill_null("[DEACTIVATED]"))
+
+    return staged.unique(
+        subset=["source", "source_id"],
+        keep="last",
+        maintain_order=True,
     )
 
 
@@ -301,7 +358,7 @@ def _align_to_silver_schema(df: pl.DataFrame) -> pa.Table:
 
 
 def _load_and_clean_bronze(source: SourcePortal) -> pl.DataFrame | None:
-    """Loads a single Bronze Iceberg table and applies structural unnesting and cleaning."""
+    """Loads a Bronze Iceberg table and applies structural unnesting and cleaning."""
     catalog = get_catalog()
     table_identifier = f"{BRONZE_NAMESPACE}.{source.value}_properties"
 
@@ -313,12 +370,12 @@ def _load_and_clean_bronze(source: SourcePortal) -> pl.DataFrame | None:
             logger.info(f"Bronze table {table_identifier} is empty.")
             return None
 
-        # Apply structural unnesting and enrichment per portal
+        # Apply structural unnesting, lifecycle restoration, and metric derivation
         df = extract_and_enrich_location(df)
         df = clean_infrastructure(df)
         df = clean_legal_context(df)
-        df = compute_derived_metrics(df)
         df = calculate_lifecycle_and_deduplicate(df)
+        df = compute_derived_metrics(df)
         df = compute_content_hash(df)
 
         return df
@@ -335,7 +392,7 @@ def process_silver(
 
     1. Loads and cleans raw records from all specified Bronze tables.
     2. Unions datasets into a cohesive multi-portal DataFrame.
-    3. Executes cross-portal Entity Resolution to discover identical physical properties.
+    3. Executes cross-portal Entity Resolution to discover identical properties.
     4. Enforces strict Silver PyArrow schema.
     5. Atomically overwrites the unified Iceberg table `silver.properties`.
     """
@@ -361,10 +418,8 @@ def process_silver(
 
     arrow_table = _align_to_silver_schema(unified_df)
 
-    try:
+    with contextlib.suppress(NamespaceAlreadyExistsError):
         catalog.create_namespace(SILVER_NAMESPACE)
-    except NamespaceAlreadyExistsError:
-        pass
 
     try:
         table = catalog.load_table(silver_identifier)

@@ -24,7 +24,10 @@ all_assets = [
 lakehouse_etl_job = define_asset_job(
     name="real_estate_lakehouse_job",
     selection=AssetSelection.all(),
-    description="Executes end-to-end extraction, normalization, entity resolution, and gold datamart materialization.",
+    description=(
+        "Executes end-to-end extraction, normalization, entity resolution, "
+        "and gold datamart materialization."
+    ),
 )
 
 # Daily scheduled run at 04:00 UTC

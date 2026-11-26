@@ -76,7 +76,8 @@ def silver_properties(
 
     context.log.info(
         f"Unified Silver table {table_id} updated: {total_records} listings "
-        f"({unique_properties} unique physical properties, {duplicate_pairs} cross-portal duplicates resolved, "
+        f"({unique_properties} unique physical properties, "
+        f"{duplicate_pairs} cross-portal duplicates resolved, "
         f"median {median_price_m2} CZK/m²)"
     )
 

@@ -1,5 +1,4 @@
-import hashlib
-from datetime import UTC, date, datetime
+from datetime import date
 from typing import ClassVar
 
 from pydantic import HttpUrl
@@ -17,14 +16,15 @@ from src.contracts.base import (
     LegalContext,
     Location,
     OwnershipType,
+    PropertyListing,
     SourcePortal,
     TransactionType,
 )
-from src.contracts.portals.base import AnyProperty, BasePortalInput
+from src.contracts.portals.base import BasePortalInput
 
 
 class BezrealitkyRawInput(BasePortalInput):
-    """Validation boundary for structured data payloads extracted from Bezrealitky GraphQL API."""
+    """Validation boundary for payloads extracted from Bezrealitky GraphQL API."""
 
     # GraphQL API Bezrealitky -> Internal TransactionType
     _TRANSACTION_MAP: ClassVar[dict[str, TransactionType]] = {
@@ -130,6 +130,20 @@ class BezrealitkyRawInput(BasePortalInput):
         """Returns supported human-readable entity keys."""
         return list(cls.API_ENTITY_MAP.keys())
 
+    @classmethod
+    def resolve_enums(
+        cls, transaction: str, entity: str
+    ) -> tuple[TransactionType, EntityType]:
+        """Resolves CLI/pipeline transaction and entity slugs into domain enums."""
+        if transaction not in cls.API_TRANSACTION_MAP:
+            raise ValueError(f"Unsupported Bezrealitky transaction: {transaction}")
+        if entity not in cls.API_ENTITY_MAP:
+            raise ValueError(f"Unsupported Bezrealitky entity: {entity}")
+
+        api_tx = cls.API_TRANSACTION_MAP[transaction]
+        api_ent = cls.API_ENTITY_MAP[entity]
+        return cls._TRANSACTION_MAP[api_tx], cls._ENTITY_MAP[api_ent]
+
     def _build_location(self) -> Location:
         """Constructs a validated domain Location entity with optional coordinates."""
         gps = None
@@ -147,16 +161,8 @@ class BezrealitkyRawInput(BasePortalInput):
         )
 
     def _build_infrastructure(self) -> Infrastructure | None:
-        """Constructs an infrastructure context if any utility indicator is present."""
-        if not any(
-            v is not None
-            for v in (
-                self.has_water,
-                self.has_electricity,
-                self.has_gas,
-                self.has_waste,
-            )
-        ):
+        """Constructs an infrastructure context if electricity or gas is specified."""
+        if self.has_electricity is None and self.has_gas is None:
             return None
 
         return Infrastructure(
@@ -177,8 +183,8 @@ class BezrealitkyRawInput(BasePortalInput):
             available_from=self.available_from,
         )
 
-    def materialize(self) -> AnyProperty:
-        """Converts validated raw API payload into an immutable domain property model."""
+    def materialize(self) -> PropertyListing:
+        """Converts validated raw API payload into an immutable domain model."""
         if self.offer_type not in self._TRANSACTION_MAP:
             raise ValueError(f"Unsupported transaction type: {self.offer_type}")
         if self.estate_type not in self._ENTITY_MAP:
@@ -186,16 +192,15 @@ class BezrealitkyRawInput(BasePortalInput):
 
         transaction_enum = self._TRANSACTION_MAP[self.offer_type]
         entity_enum = self._ENTITY_MAP[self.estate_type]
-
-        # Deterministic Lakehouse entity ID: sha256(bezrealitky_<source_id>)
-        entity_id = hashlib.sha256(
-            f"{SourcePortal.BEZREALITKY.value}_{self.source_id}".encode()
-        ).hexdigest()
+        entity_id = self.generate_entity_id(SourcePortal.BEZREALITKY, self.source_id)
 
         full_url = (
             self.uri
             if self.uri.startswith("http")
-            else f"https://www.bezrealitky.cz/nemovitosti-byty-domy/{self.uri.lstrip('/')}"
+            else (
+                "https://www.bezrealitky.cz/nemovitosti-byty-domy/"
+                f"{self.uri.lstrip('/')}"
+            )
         )
 
         currency_enum = (
@@ -205,7 +210,7 @@ class BezrealitkyRawInput(BasePortalInput):
         )
 
         listing_url = HttpUrl(full_url)
-        scraped_at = datetime.now(UTC)
+        scraped_at = self._get_utc_now()
         location = self._build_location()
         infrastructure = self._build_infrastructure()
         legal = self._build_legal_context()

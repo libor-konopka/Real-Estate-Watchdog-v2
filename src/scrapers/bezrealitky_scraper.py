@@ -4,7 +4,6 @@ from typing import Any, ClassVar
 
 import aiohttp
 from loguru import logger
-from pydantic import ValidationError
 
 from src.contracts.base import BuildingProperty, LandProperty
 from src.contracts.portals.bezrealitky import BezrealitkyRawInput
@@ -47,7 +46,6 @@ class BezrealitkyScraper:
             offset: $offset
             locale: $locale
         ) {
-            totalCount
             list {
                 id
                 uri
@@ -95,7 +93,6 @@ class BezrealitkyScraper:
         max_retries: int = 3,
     ) -> dict[str, Any] | None:
         """Executes paginated GraphQL POST query with exponential backoff."""
-        # Inject explicit locale parameter alongside array filters
         variables: dict[str, Any] = {
             "offerType": [offer_type],
             "estateType": [estate_type],
@@ -120,7 +117,8 @@ class BezrealitkyScraper:
                     ) as response:
                         if response.status != 200:
                             logger.warning(
-                                f"GraphQL query failed (status {response.status}), attempt {attempt}/{max_retries}"
+                                f"GraphQL query failed (status {response.status}), "
+                                f"attempt {attempt}/{max_retries}"
                             )
                             if attempt < max_retries:
                                 await asyncio.sleep(2.0**attempt)
@@ -137,7 +135,8 @@ class BezrealitkyScraper:
 
                 except (TimeoutError, aiohttp.ClientError) as exc:
                     logger.warning(
-                        f"Network fault on offset {offset} ({exc}), attempt {attempt}/{max_retries}"
+                        f"Network fault on offset {offset} ({exc}), "
+                        f"attempt {attempt}/{max_retries}"
                     )
                     if attempt < max_retries:
                         await asyncio.sleep(2.0**attempt)
@@ -150,15 +149,14 @@ class BezrealitkyScraper:
         self,
         transaction: str,
         entity: str,
-        known_source_ids: set[str] | None = None,
+        known_data: dict[str, float | None] | None = None,
         limit_per_page: int = 15,
         max_pages: int = 50,
         max_consecutive_known: int = 10,
     ) -> AsyncIterator[BuildingProperty | LandProperty]:
-        """Iterates through paginated GraphQL results and yields validated domain properties."""
-        known_ids = known_source_ids or set()
+        """Iterates through GraphQL results and yields new or updated properties."""
+        known_records = known_data or {}
 
-        # Map human-readable slugs to Bezrealitky GraphQL enums
         api_offer = BezrealitkyRawInput.API_TRANSACTION_MAP.get(transaction)
         api_estate = BezrealitkyRawInput.API_ENTITY_MAP.get(entity)
 
@@ -179,7 +177,8 @@ class BezrealitkyScraper:
 
             if not data:
                 logger.info(
-                    f"No response or error reached for {transaction}/{entity} at offset {current_offset}."
+                    f"No response or error reached for {transaction}/{entity} "
+                    f"at offset {current_offset}."
                 )
                 break
 
@@ -188,42 +187,46 @@ class BezrealitkyScraper:
 
             if not items:
                 logger.info(
-                    f"Reached end of listings for {transaction}/{entity} (total scanned: {current_offset})."
+                    f"Reached end of listings for {transaction}/{entity} "
+                    f"(total scanned: {current_offset})."
                 )
                 break
 
             page_yield_count = 0
             for raw_item in items:
-                source_id = str(raw_item.get("id"))
+                raw_id = raw_item.get("id")
+                if raw_id is None or not str(raw_id).strip():
+                    continue
+                source_id = str(raw_id).strip()
 
-                # Fast-path skipping: stop crawling if consecutive known listings threshold is reached
-                if source_id in known_ids:
+                raw_price = raw_item.get("price")
+                current_price = float(raw_price) if raw_price is not None else None
+
+                if (
+                    source_id in known_records
+                    and known_records[source_id] == current_price
+                ):
                     consecutive_known += 1
                     if consecutive_known >= max_consecutive_known:
                         logger.info(
-                            f"Reached {consecutive_known} consecutive known listings. Fast-path stop."
+                            f"Reached {consecutive_known} consecutive unchanged "
+                            "listings. Fast-path stop."
                         )
                         return
                     continue
 
                 consecutive_known = 0
 
-                try:
-                    domain_entity = self.parser.parse_advert(raw_item)
-                    if domain_entity:
-                        yield domain_entity
-                        page_yield_count += 1
-                except (ValidationError, ValueError, TypeError, KeyError) as exc:
-                    logger.warning(
-                        f"Failed to parse Bezrealitky advert {source_id}: {exc}"
-                    )
-                    continue
+                domain_entity = self.parser.parse_advert(raw_item)
+                if domain_entity:
+                    yield domain_entity
+                    page_yield_count += 1
 
             logger.debug(
-                f"Page {page + 1} (offset {current_offset}): extracted {page_yield_count}/{len(items)} listings."
+                f"Page {page + 1} (offset {current_offset}): "
+                f"extracted {page_yield_count}/{len(items)} listings."
             )
 
-            # Move offset forward by page size
             current_offset += limit_per_page
             if len(items) < limit_per_page:
                 break
