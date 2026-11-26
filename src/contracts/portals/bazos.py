@@ -100,10 +100,9 @@ class BazosInputModel(BasePortalInput):
         source_id = self._extract_source_id()
         entity_id = self.generate_entity_id(SourcePortal.BAZOS, source_id)
 
-        transaction_enum = self._TRANSACTION_MAP.get(
-            self.raw_transaction, TransactionType.SALE
+        transaction_enum, entity_enum = self.resolve_enums(
+            self.raw_transaction, self.raw_entity
         )
-        entity_enum = self._ENTITY_MAP.get(self.raw_entity, EntityType.APARTMENT)
 
         currency_enum = (
             Currency(self.currency.lower())
@@ -162,7 +161,3 @@ class BazosInputModel(BasePortalInput):
             condition=self.condition,
             energy_class=self.energy_class,
         )
-
-
-# Alias ensuring backward compatibility across all modules
-BazosRawInput = BazosInputModel

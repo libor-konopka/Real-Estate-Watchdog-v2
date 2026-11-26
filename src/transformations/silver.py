@@ -1,25 +1,16 @@
-import contextlib
 import hashlib
 import math
 
 import polars as pl
 import pyarrow as pa
 from loguru import logger
-from pyiceberg.exceptions import (
-    NamespaceAlreadyExistsError,
-    NoSuchNamespaceError,
-    NoSuchTableError,
-)
+from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 from pyiceberg.table import Table
 
 from src.contracts.base import EntityType, SourcePortal
 from src.contracts.schemas import SILVER_PROPERTY_ARROW_SCHEMA
-from src.storage.catalog import get_catalog
+from src.storage.catalog import get_catalog_manager
 from src.transformations.enrichment import load_geo_lookup_df
-
-BRONZE_NAMESPACE = "bronze"
-SILVER_NAMESPACE = "silver"
-UNIFIED_SILVER_TABLE = "properties"
 
 
 def haversine_distance_expr(
@@ -45,7 +36,7 @@ def haversine_distance_expr(
         delta_lambda / 2.0
     ).sin().pow(2)
 
-    c = 2.0 * a.sqrt().arcsin()
+    c = 2.0 * a.clip(0.0, 1.0).sqrt().arcsin()
     return r_meters * c
 
 
@@ -87,7 +78,9 @@ def match_cross_portal_duplicates(
             pl.lit(None).cast(pl.String).alias("canonical_property_id")
         )
 
-    staged = generate_blocking_key(df)
+    staged = generate_blocking_key(df).with_columns(
+        pl.coalesce(["usable_area_m2", "land_area_m2"]).alias("_effective_area_m2")
+    )
 
     candidate_cols = [
         "id",
@@ -95,7 +88,7 @@ def match_cross_portal_duplicates(
         "municipality",
         "blocking_key",
         "price",
-        "usable_area_m2",
+        "_effective_area_m2",
         "latitude",
         "longitude",
     ]
@@ -116,22 +109,25 @@ def match_cross_portal_duplicates(
 
     if candidates.is_empty():
         return staged.with_columns(pl.col("id").alias("canonical_property_id")).drop(
-            "blocking_key"
+            ["blocking_key", "_effective_area_m2"]
         )
 
-    price_diff_ratio = (pl.col("price") - pl.col("price_match")).abs() / (
-        pl.coalesce([pl.col("price"), pl.lit(1.0)])
-    )
+    max_price = pl.max_horizontal("price", "price_match")
+    price_diff_ratio = (pl.col("price") - pl.col("price_match")).abs() / max_price
     price_condition = (
         pl.col("price").is_not_null()
         & pl.col("price_match").is_not_null()
+        & (pl.col("price") > 0)
+        & (pl.col("price_match") > 0)
         & (price_diff_ratio <= max_price_diff_ratio)
     )
 
-    area_delta = (pl.col("usable_area_m2") - pl.col("usable_area_m2_match")).abs()
+    area_delta = (
+        pl.col("_effective_area_m2") - pl.col("_effective_area_m2_match")
+    ).abs()
     area_condition = (
-        pl.col("usable_area_m2").is_not_null()
-        & pl.col("usable_area_m2_match").is_not_null()
+        pl.col("_effective_area_m2").is_not_null()
+        & pl.col("_effective_area_m2_match").is_not_null()
         & (area_delta <= max_area_diff_m2)
     )
 
@@ -182,7 +178,7 @@ def match_cross_portal_duplicates(
         .with_columns(
             pl.coalesce(["canonical_id", "id"]).alias("canonical_property_id")
         )
-        .drop(["blocking_key", "canonical_id"])
+        .drop(["blocking_key", "_effective_area_m2", "canonical_id"])
     )
 
 
@@ -269,10 +265,7 @@ def compute_derived_metrics(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def calculate_lifecycle_and_deduplicate(df: pl.DataFrame) -> pl.DataFrame:
-    """Computes lifecycle timestamps, preserves attributes across tombstones,
-
-    and keeps the latest snapshot per listing.
-    """
+    """Computes lifecycle timestamps, restores tombstones, and deduplicates."""
     excluded_cols = {
         "source",
         "source_id",
@@ -298,10 +291,15 @@ def calculate_lifecycle_and_deduplicate(df: pl.DataFrame) -> pl.DataFrame:
             .alias("title")
         )
 
+    # Restore attributes from prior snapshots only onto inactive tombstone rows;
+    # active updates keep their explicit values (including nullified fields).
     if fillable_cols:
         staged = staged.with_columns(
             [
-                pl.col(col).forward_fill().over(["source", "source_id"])
+                pl.when(pl.col("is_active"))
+                .then(pl.col(col))
+                .otherwise(pl.col(col).forward_fill().over(["source", "source_id"]))
+                .alias(col)
                 for col in fillable_cols
             ]
         )
@@ -359,8 +357,9 @@ def _align_to_silver_schema(df: pl.DataFrame) -> pa.Table:
 
 def _load_and_clean_bronze(source: SourcePortal) -> pl.DataFrame | None:
     """Loads a Bronze Iceberg table and applies structural unnesting and cleaning."""
-    catalog = get_catalog()
-    table_identifier = f"{BRONZE_NAMESPACE}.{source.value}_properties"
+    manager = get_catalog_manager()
+    catalog = manager.get_catalog()
+    table_identifier = manager.bronze_table_id(source)
 
     try:
         bronze_table = catalog.load_table(table_identifier)
@@ -397,8 +396,8 @@ def process_silver(
     5. Atomically overwrites the unified Iceberg table `silver.properties`.
     """
     target_sources = sources or [SourcePortal.BAZOS, SourcePortal.BEZREALITKY]
-    catalog = get_catalog()
-    silver_identifier = f"{SILVER_NAMESPACE}.{UNIFIED_SILVER_TABLE}"
+    manager = get_catalog_manager()
+    silver_identifier = manager.silver_table_id
 
     cleaned_dfs: list[pl.DataFrame] = []
     for src in target_sources:
@@ -417,19 +416,7 @@ def process_silver(
     unified_df = match_cross_portal_duplicates(unified_df)
 
     arrow_table = _align_to_silver_schema(unified_df)
-
-    with contextlib.suppress(NamespaceAlreadyExistsError):
-        catalog.create_namespace(SILVER_NAMESPACE)
-
-    try:
-        table = catalog.load_table(silver_identifier)
-        table.overwrite(arrow_table)
-    except NoSuchTableError:
-        table = catalog.create_table(
-            identifier=silver_identifier,
-            schema=SILVER_PROPERTY_ARROW_SCHEMA,
-        )
-        table.append(arrow_table)
+    table = manager.overwrite_or_create_table(silver_identifier, arrow_table)
 
     logger.info(
         f"Unified Silver layer updated: {silver_identifier} "

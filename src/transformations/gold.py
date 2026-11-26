@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 import polars as pl
@@ -5,10 +6,46 @@ from loguru import logger
 from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 from pyiceberg.table import Table
 
+from src.contracts.base import Currency, EntityType
 from src.storage.catalog import get_catalog_manager
 
 # Filters out placeholder/symbolic prices (e.g., "1 Kč") that skew market benchmarks
 DEFAULT_MIN_VALID_PRICE_CZK: float = 1_000.0
+
+
+def _effective_area_expr(columns: Sequence[str]) -> pl.Expr:
+    """Resolves effective area expression for both buildings and land."""
+    building_cols = [
+        pl.col(col) for col in ("usable_area_m2", "built_up_area_m2") if col in columns
+    ]
+    building_area = (
+        pl.coalesce(building_cols) if building_cols else pl.lit(None, dtype=pl.Float64)
+    )
+    land_area = (
+        pl.col("land_area_m2")
+        if "land_area_m2" in columns
+        else pl.lit(None, dtype=pl.Float64)
+    )
+
+    return (
+        pl.when(pl.col("entity_type") == EntityType.LAND.value)
+        .then(land_area)
+        .otherwise(building_area)
+    )
+
+
+def _deduplicate_canonical(df: pl.DataFrame) -> pl.DataFrame:
+    """Keeps one representative listing per physical property.
+
+    Prefers active listings and the most recent observation.
+    """
+    if "canonical_property_id" not in df.columns or df.is_empty():
+        return df
+
+    return df.sort(["is_active", "last_seen_at"]).unique(
+        subset=["canonical_property_id"],
+        keep="last",
+    )
 
 
 def _save_gold_table(
@@ -33,15 +70,15 @@ def compute_market_metrics(
     df: pl.DataFrame,
     min_valid_price: float = DEFAULT_MIN_VALID_PRICE_CZK,
 ) -> pl.DataFrame:
-    """Aggregates market indicators (medians, averages, days on market)
-
-    grouped by administrative boundaries and property segments.
-    """
+    """Aggregates market indicators grouped by district and property segment."""
     now_utc = datetime.now(UTC)
 
-    valid_df = df.filter(
+    deduped_df = _deduplicate_canonical(df)
+
+    valid_df = deduped_df.filter(
         pl.col("price").is_not_null()
         & (pl.col("price") >= min_valid_price)
+        & (pl.col("currency").str.to_lowercase() == Currency.CZK.value)
         & pl.col("region").is_not_null()
         & pl.col("district").is_not_null()
     )
@@ -56,7 +93,8 @@ def compute_market_metrics(
             .clip(lower_bound=0)
         )
         .cast(pl.Int32)
-        .alias("days_on_market")
+        .alias("days_on_market"),
+        _effective_area_expr(valid_df.columns).alias("_effective_area_m2"),
     )
 
     grouping_keys = [
@@ -77,7 +115,7 @@ def compute_market_metrics(
                 pl.col("price").mean().round(0).alias("mean_price"),
                 pl.col("price_per_m2").median().round(2).alias("median_price_per_m2"),
                 pl.col("price_per_m2").mean().round(2).alias("mean_price_per_m2"),
-                pl.col("usable_area_m2").median().round(1).alias("median_area_m2"),
+                pl.col("_effective_area_m2").median().round(1).alias("median_area_m2"),
                 pl.col("days_on_market")
                 .median()
                 .round(0)
@@ -97,14 +135,14 @@ def compute_investment_opportunities(
     min_segment_sample_size: int = 5,
     min_valid_price: float = DEFAULT_MIN_VALID_PRICE_CZK,
 ) -> pl.DataFrame:
-    """Identifies undervalued active listings by comparing price_per_m2
+    """Identifies undervalued active listings against local district medians."""
+    deduped_df = _deduplicate_canonical(df)
 
-    against the local benchmark median using analytical window expressions.
-    """
-    active_candidates = df.filter(
+    active_candidates = deduped_df.filter(
         pl.col("is_active")
         & pl.col("price").is_not_null()
         & (pl.col("price") >= min_valid_price)
+        & (pl.col("currency").str.to_lowercase() == Currency.CZK.value)
         & pl.col("price_per_m2").is_not_null()
         & (pl.col("price_per_m2") > 0)
         & pl.col("district").is_not_null()
@@ -116,6 +154,7 @@ def compute_investment_opportunities(
     segment_partition = ["district", "transaction_type", "entity_type"]
 
     enriched = active_candidates.with_columns(
+        _effective_area_expr(active_candidates.columns).alias("area_m2"),
         pl.len().over(segment_partition).cast(pl.Int32).alias("segment_sample_size"),
         pl.col("price_per_m2")
         .median()
@@ -150,7 +189,7 @@ def compute_investment_opportunities(
                 "transaction_type",
                 "entity_type",
                 "price",
-                "usable_area_m2",
+                "area_m2",
                 "price_per_m2",
                 "segment_median_price_m2",
                 "discount_pct",

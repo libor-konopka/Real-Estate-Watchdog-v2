@@ -8,6 +8,7 @@ from pyiceberg.exceptions import (
     RESTError,
 )
 
+from src.contracts.base import EntityType
 from src.storage.catalog import get_catalog_manager
 
 
@@ -133,7 +134,7 @@ def render_investment_opportunities(opps_df: pl.DataFrame) -> None:
             "transaction_type",
             "entity_type",
             "price",
-            "usable_area_m2",
+            "area_m2",
             "price_per_m2",
             "segment_median_price_m2",
             "url",
@@ -193,7 +194,7 @@ def render_silver_explorer(silver_df: pl.DataFrame) -> None:
         filtered = filtered.filter(pl.col("is_active"))
 
     if deduplicate_cross_portal and "canonical_property_id" in filtered.columns:
-        filtered = filtered.sort("last_seen_at").unique(
+        filtered = filtered.sort(["is_active", "last_seen_at"]).unique(
             subset=["canonical_property_id"], keep="last"
         )
 
@@ -201,7 +202,10 @@ def render_silver_explorer(silver_df: pl.DataFrame) -> None:
         st.info("Zvoleným filtrům neodpovídají žádné nemovitosti.")
         return
 
-    median_area = _safe_median(filtered["usable_area_m2"])
+    area_col = (
+        "land_area_m2" if selected_ent == EntityType.LAND.value else "usable_area_m2"
+    )
+    median_area = _safe_median(filtered[area_col])
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Počet nemovitostí", filtered.height)

@@ -2,7 +2,7 @@ name: real-estate-watchdog-v2
 
 services:
   minio:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     container_name: lakehouse-minio
     environment:
       - MINIO_ROOT_USER=admin
@@ -20,7 +20,7 @@ services:
       - minio_data:/data
 
   minio-init:
-    image: amazon/aws-cli:latest
+    image: amazon/aws-cli:2.27.0
     container_name: lakehouse-minio-init
     depends_on:
       minio:
@@ -34,8 +34,9 @@ services:
       "aws --endpoint-url http://minio:9000 s3 mb s3://warehouse || true"
 
   nessie:
-    image: ghcr.io/projectnessie/nessie:latest
+    image: ghcr.io/projectnessie/nessie:0.103.3
     container_name: lakehouse-nessie
+    user: "0:0" # Ensures write permissions for RocksDB inside the named volume
     depends_on:
       minio:
         condition: service_healthy
@@ -43,6 +44,8 @@ services:
       - "19120:19120"
     environment:
       - QUARKUS_HTTP_PORT=19120
+      - nessie.version.store.type=ROCKSDB
+      - nessie.version.store.persist.rocks.db-path=/nessie/data
       - nessie.catalog.default-warehouse=default
       - nessie.catalog.warehouses.default.location=s3://warehouse/
       - nessie.catalog.service.s3.default-options.endpoint=http://minio:9000
@@ -52,6 +55,9 @@ services:
       - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
       - nessie.catalog.secrets.access-key.name=admin
       - nessie.catalog.secrets.access-key.secret=password
+    volumes:
+      - nessie_data:/nessie/data
 
 volumes:
   minio_data:
+  nessie_data:

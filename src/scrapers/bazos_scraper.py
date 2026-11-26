@@ -32,6 +32,10 @@ class BazosScraper:
         "Connection": "keep-alive",
     }
 
+    _RETRYABLE_STATUS_CODES: ClassVar[frozenset[int]] = frozenset(
+        {429, 500, 502, 503, 504}
+    )
+
     # Bazoš displays 20 listings per pagination page
     PAGE_SIZE: int = 20
 
@@ -110,20 +114,44 @@ class BazosScraper:
 
             await asyncio.sleep(self._request_delay)
 
-    async def _fetch_catalog_page(self, url: str) -> list[BazosListingCard]:
-        """Fetches and parses a single catalog pagination page."""
-        try:
-            async with self.session.get(url, headers=self._HEADERS) as response:
-                if response.status != 200:
-                    logger.warning(
-                        f"Catalog page returned status {response.status}: {url}"
-                    )
+    async def _fetch_catalog_page(
+        self, url: str, max_retries: int = 3
+    ) -> list[BazosListingCard]:
+        """Fetches and parses a single catalog pagination page with retry logic."""
+        for attempt in range(1, max_retries + 1):
+            should_retry = False
+            try:
+                async with self.session.get(url, headers=self._HEADERS) as response:
+                    if response.status in self._RETRYABLE_STATUS_CODES:
+                        logger.warning(
+                            f"Transient status {response.status} on catalog {url} "
+                            f"(attempt {attempt}/{max_retries})."
+                        )
+                        should_retry = True
+                    elif response.status != 200:
+                        logger.warning(
+                            f"Catalog page returned status {response.status}: {url}"
+                        )
+                        return []
+                    else:
+                        html = await response.text(encoding="utf-8", errors="replace")
+                        return BazosDOMParser.parse_catalog_page(html, self.base_url)
+            except (TimeoutError, aiohttp.ClientError) as e:
+                if attempt == max_retries:
+                    logger.error(f"Network error while fetching catalog {url}: {e}")
                     return []
-                html = await response.text(encoding="utf-8", errors="replace")
-                return BazosDOMParser.parse_catalog_page(html, self.base_url)
-        except (TimeoutError, aiohttp.ClientError) as e:
-            logger.error(f"Network error while fetching catalog {url}: {e}")
-            return []
+                logger.debug(
+                    f"Network issue on catalog {url}: {e} "
+                    f"(attempt {attempt}/{max_retries})."
+                )
+                should_retry = True
+
+            if should_retry:
+                if attempt == max_retries:
+                    return []
+                await asyncio.sleep(2 * attempt)
+
+        return []
 
     async def _process_detail(
         self,
@@ -135,20 +163,38 @@ class BazosScraper:
         """Fetches listing detail, parses DOM, and returns a domain model."""
         async with self._semaphore:
             for attempt in range(1, max_retries + 1):
+                should_retry = False
+                html_content: str | None = None
+
                 try:
                     async with self.session.get(
                         entity_url, headers=self._HEADERS
                     ) as response:
-                        if response.status != 200:
+                        if response.status in self._RETRYABLE_STATUS_CODES:
+                            logger.warning(
+                                f"Transient status {response.status} for "
+                                f"{entity_url} (attempt {attempt}/{max_retries})."
+                            )
+                            should_retry = True
+                        elif response.status != 200:
                             logger.warning(
                                 f"Failed to fetch detail (status {response.status}): "
                                 f"{entity_url}"
                             )
                             return None
+                        else:
+                            html_content = await response.text(
+                                encoding="utf-8", errors="replace"
+                            )
 
-                        html_content = await response.text(
-                            encoding="utf-8", errors="replace"
-                        )
+                    if should_retry:
+                        if attempt == max_retries:
+                            return None
+                        await asyncio.sleep(2 * attempt)
+                        continue
+
+                    if html_content is None:
+                        return None
 
                     parser = BazosDOMParser(html_content, entity_url)
 

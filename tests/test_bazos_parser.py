@@ -102,3 +102,23 @@ def test_extract_land_area_does_not_double_count_repeated_mentions() -> None:
     empty_loc = parser.extract_location()
     assert empty_loc.municipality is None
     assert empty_loc.postal_code is None
+
+
+def test_extract_infrastructure_avoids_false_positives_and_handles_negations() -> None:
+    parser = BazosDOMParser("<html></html>", "https://reality.bazos.cz/inzerat/1/a.php")
+
+    desc_false_pos = (
+        "Klidná čtvrť ve čtvrtém patře, plynulý chod SVJ, bez plynu a bez elektřiny."
+    )
+    infra = parser.extract_infrastructure(desc_false_pos)
+
+    assert infra.water is None
+    assert infra.gas is False
+    assert infra.electricity is False
+
+    desc_borehole = "Na pozemku je vlastní vrt a přípojka plynu."
+    infra_ok = parser.extract_infrastructure(desc_borehole)
+
+    assert infra_ok.water is not None
+    assert infra_ok.water.value == "borehole"
+    assert infra_ok.gas is True

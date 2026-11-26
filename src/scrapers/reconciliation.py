@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
@@ -7,13 +6,14 @@ import aiohttp
 from loguru import logger
 
 from src.contracts.base import ActiveListingRef, SourcePortal
+from src.contracts.portals.base import BasePortalInput
 
 
-class BazosReconciler:
+class PortalReconciler:
     """Performs high-throughput HTTP verification of currently active listings.
 
-    Emits tombstone records for listings that have been deleted or expired on the source
-    portal.
+    Emits tombstone records for listings that have been deleted or expired on the
+    source portal.
     """
 
     _HEADERS: ClassVar[dict[str, str]] = {
@@ -26,21 +26,26 @@ class BazosReconciler:
         "Accept-Language": "cs,en-US;q=0.7,en;q=0.3",
     }
 
+    _PRESERVE_ACTIVE_STATUSES: ClassVar[frozenset[int]] = frozenset({403, 405, 429})
+
     def __init__(
         self,
         session: aiohttp.ClientSession,
+        source: SourcePortal,
         concurrency: int = 20,
         request_timeout_seconds: int = 10,
     ) -> None:
         self.session = session
+        self.source = source
         self._semaphore = asyncio.Semaphore(concurrency)
         self._timeout = aiohttp.ClientTimeout(total=request_timeout_seconds)
 
     async def _check_listing_active(self, url: str) -> bool:
         """Executes a lightweight HEAD request with redirect resolution.
 
-        Returns False if the resource is missing (404/410) or redirected away from the
-        listing page.
+        Returns False only when the resource is definitively missing (404/410) or
+        redirected away from the listing page. Transient or rate-limit responses
+        preserve the active state to avoid false deactivations.
         """
         async with self._semaphore:
             try:
@@ -53,17 +58,32 @@ class BazosReconciler:
                     if resp.status in (404, 410):
                         return False
 
-                    # Bazos redirects deleted/expired ads back to the parent category
-                    # page
+                    if (
+                        resp.status >= 500
+                        or resp.status in self._PRESERVE_ACTIVE_STATUSES
+                    ):
+                        logger.warning(
+                            f"Non-terminal status {resp.status} probing {url}. "
+                            "Preserving active state."
+                        )
+                        return True
+
+                    # Portals redirect deleted/expired ads back to a category page
                     normalized_original = url.rstrip("/")
                     normalized_resolved = str(resp.url).rstrip("/")
                     if normalized_resolved != normalized_original:
                         return False
 
-                    return resp.status == 200
+                    if resp.status == 200:
+                        return True
+
+                    logger.warning(
+                        f"Unexpected status {resp.status} probing {url}. "
+                        "Preserving active state."
+                    )
+                    return True
 
             except (TimeoutError, aiohttp.ClientError) as exc:
-                # Network flakiness should not trigger false deactivations
                 logger.warning(
                     f"Transient network error probing listing {url}: {exc}. "
                     "Preserving active state."
@@ -88,24 +108,26 @@ class BazosReconciler:
             return []
 
         logger.info(
-            f"Starting reconciliation audit for {len(active_records)} active listings "
-            f"({transaction}/{entity_type})..."
+            f"Starting reconciliation audit for {len(active_records)} active "
+            f"{self.source.value} listings ({transaction}/{entity_type})..."
         )
 
         async def probe(ref: ActiveListingRef) -> dict[str, Any] | None:
             is_active = await self._check_listing_active(ref.url)
             if not is_active:
-                logger.info(f"Listing deemed inactive on source: {ref.source_id}")
-                entity_id = hashlib.sha256(
-                    f"{SourcePortal.BAZOS.value}_{ref.source_id}".encode()
-                ).hexdigest()
+                logger.info(
+                    f"Listing deemed inactive on {self.source.value}: {ref.source_id}"
+                )
+                entity_id = BasePortalInput.generate_entity_id(
+                    self.source, ref.source_id
+                )
                 return {
                     "id": entity_id,
                     "title": "[DEACTIVATED]",
                     "is_active": False,
                     "source_id": ref.source_id,
                     "url": ref.url,
-                    "source": SourcePortal.BAZOS.value,
+                    "source": self.source.value,
                     "transaction_type": transaction,
                     "entity_type": entity_type,
                     "scraped_at": datetime.now(UTC),
@@ -124,7 +146,41 @@ class BazosReconciler:
 
         tombstones = [res for res in results if res is not None]
         logger.info(
-            f"Reconciliation completed: {len(tombstones)} inactive listings "
-            "marked for deactivation."
+            f"Reconciliation completed for {self.source.value}: {len(tombstones)} "
+            "inactive listings marked for deactivation."
         )
         return tombstones
+
+
+class BazosReconciler(PortalReconciler):
+    """HTTP reconciler configured for Bazos listings."""
+
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        concurrency: int = 20,
+        request_timeout_seconds: int = 10,
+    ) -> None:
+        super().__init__(
+            session=session,
+            source=SourcePortal.BAZOS,
+            concurrency=concurrency,
+            request_timeout_seconds=request_timeout_seconds,
+        )
+
+
+class BezrealitkyReconciler(PortalReconciler):
+    """HTTP reconciler configured for Bezrealitky listings."""
+
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        concurrency: int = 10,
+        request_timeout_seconds: int = 10,
+    ) -> None:
+        super().__init__(
+            session=session,
+            source=SourcePortal.BEZREALITKY,
+            concurrency=concurrency,
+            request_timeout_seconds=request_timeout_seconds,
+        )

@@ -5,7 +5,7 @@ import re
 # ==========================================
 RE_WATER_PUBLIC = re.compile(r"vodovod|městská\s+voda|obecní\s+voda", re.IGNORECASE)
 RE_WATER_WELL = re.compile(r"studna|studnu", re.IGNORECASE)
-RE_WATER_BOREHOLE = re.compile(r"vrt|vrtaná\s+studna", re.IGNORECASE)
+RE_WATER_BOREHOLE = re.compile(r"\bvrt\b|vrtan[áé]\s+studn[auy]", re.IGNORECASE)
 
 RE_WASTE_SEWER = re.compile(r"kanalizac|obecní\s+odpad|stočn[eé]", re.IGNORECASE)
 RE_WASTE_SEPTIC = re.compile(r"septik", re.IGNORECASE)
@@ -16,7 +16,11 @@ RE_NO_ELEC = re.compile(
     r"bez\s+(?:zavedené\s+)?elektřiny|bez\s+el\.|elektřina\s+(?:zde\s+)?není",
     re.IGNORECASE,
 )
-RE_GAS = re.compile(r"plyn", re.IGNORECASE)
+RE_GAS = re.compile(r"\bplyn(?:u|em|y|ov[ýáéím]+)?\b", re.IGNORECASE)
+RE_NO_GAS = re.compile(
+    r"bez\s+(?:zavedeného\s+)?plynu|plyn\s+(?:zde\s+)?není",
+    re.IGNORECASE,
+)
 RE_ALL_NETWORKS = re.compile(
     r"vešker[eé]\s+(?:inženýrsk[eé]\s+)?sítě|"
     r"všechny\s+(?:inženýrsk[eé]\s+)?sítě|"
@@ -112,26 +116,6 @@ RE_USABLE_AREA_STRUCT = re.compile(
     r"(?:plocha|výměra|rozloha|velikost)[^:]{0,20}?:\s*"
     r"(\d+(?:[ \xa0]\d+)*(?:[.,]\d+)?)",
     re.IGNORECASE,
-)
-
-RE_USABLE_AREA_SIMPLE = re.compile(
-    r"(?:plo(?:ch|š)\w+|výměr\w+|rozloh\w+|velikos\w+)\D{0,30}?"
-    r"(\d+(?:[ \xa0]\d+)*(?:[.,]\d+)?)\s*"
-    r"(?:m[2²\'’´`]?|metr\w*|m\s*čtverečn\w*)(?=[.,\s/)]|$)",
-    re.IGNORECASE,
-)
-
-RE_USABLE_AREA_DISP = re.compile(
-    r"(?:byt\w*|apartm[aá]n\w*|garson\w*|\d\s*\+?\s*(?:1|kk|[kK]{2}))\D{0,40}?"
-    r"(\d+(?:[ \xa0]\d+)*(?:[.,]\d+)?)\s*\.?\s*"
-    r"(?:m[2²\'’´`]?|metr\w*|m\s*čtverečn\w*)(?=[.,\s/)]|$)",
-    re.IGNORECASE,
-)
-
-RE_USABLE_AREA_START = re.compile(
-    r"^\s*(\d+(?:[ \xa0]\d+)*(?:[.,]\d+)?)\s*"
-    r"(?:m[2²\'’´`]?|metr\w*|m\s*čtverečn\w*)(?=[.,\s/)]|$)",
-    re.IGNORECASE | re.MULTILINE,
 )
 
 # ==========================================

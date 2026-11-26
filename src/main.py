@@ -54,14 +54,17 @@ async def run_pipeline() -> None:
     connector, timeout = create_http_session_params()
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        (bazos_new, bazos_deactivated), bezrealitky_new = await asyncio.gather(
+        (
+            (bazos_new, bazos_deactivated),
+            (bezrealitky_new, bezrealitky_deactivated),
+        ) = await asyncio.gather(
             ingest_bazos_portal(session, batch_id),
             ingest_bezrealitky_portal(session, batch_id),
         )
 
     logger.info(
         f"Bronze ingestion finished | Bazos: +{bazos_new} / -{bazos_deactivated} | "
-        f"Bezrealitky: +{bezrealitky_new}"
+        f"Bezrealitky: +{bezrealitky_new} / -{bezrealitky_deactivated}"
     )
 
     logger.info("Materializing unified Silver layer (silver.properties)...")

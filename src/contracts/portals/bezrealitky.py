@@ -1,4 +1,3 @@
-from datetime import date
 from typing import ClassVar
 
 from pydantic import HttpUrl
@@ -11,12 +10,10 @@ from src.contracts.base import (
     EnergyClass,
     EntityType,
     GPSCoordinates,
-    Infrastructure,
     LandProperty,
     LegalContext,
     Location,
     OwnershipType,
-    PropertyListing,
     SourcePortal,
     TransactionType,
 )
@@ -96,7 +93,6 @@ class BezrealitkyRawInput(BasePortalInput):
     currency: str = "czk"
 
     # Precise spatial attributes
-    region: str | None = None
     district: str | None = None
     municipality: str | None = None
     postal_code: str | None = None
@@ -112,13 +108,6 @@ class BezrealitkyRawInput(BasePortalInput):
     construction: str | None = None
     ownership: str | None = None
     penb: str | None = None
-    available_from: date | None = None
-
-    # Utility indicators
-    has_water: bool | None = None
-    has_electricity: bool | None = None
-    has_gas: bool | None = None
-    has_waste: bool | None = None
 
     @classmethod
     def get_supported_transactions(cls) -> list[str]:
@@ -153,37 +142,23 @@ class BezrealitkyRawInput(BasePortalInput):
         clean_postal = self.postal_code.replace(" ", "") if self.postal_code else None
 
         return Location(
-            region=self.region,
             district=self.district,
             municipality=self.municipality,
             postal_code=clean_postal,
             gps=gps,
         )
 
-    def _build_infrastructure(self) -> Infrastructure | None:
-        """Constructs an infrastructure context if electricity or gas is specified."""
-        if self.has_electricity is None and self.has_gas is None:
-            return None
-
-        return Infrastructure(
-            electricity=self.has_electricity,
-            gas=self.has_gas,
-        )
-
     def _build_legal_context(self) -> LegalContext:
-        """Translates raw ownership and availability into domain LegalContext."""
+        """Translates raw ownership into domain LegalContext."""
         ownership_enum = (
             self._OWNERSHIP_MAP[self.ownership]
             if self.ownership and self.ownership in self._OWNERSHIP_MAP
             else None
         )
 
-        return LegalContext(
-            ownership=ownership_enum,
-            available_from=self.available_from,
-        )
+        return LegalContext(ownership=ownership_enum)
 
-    def materialize(self) -> PropertyListing:
+    def materialize(self) -> BuildingProperty | LandProperty:
         """Converts validated raw API payload into an immutable domain model."""
         if self.offer_type not in self._TRANSACTION_MAP:
             raise ValueError(f"Unsupported transaction type: {self.offer_type}")
@@ -212,7 +187,6 @@ class BezrealitkyRawInput(BasePortalInput):
         listing_url = HttpUrl(full_url)
         scraped_at = self._get_utc_now()
         location = self._build_location()
-        infrastructure = self._build_infrastructure()
         legal = self._build_legal_context()
 
         if entity_enum == EntityType.LAND:
@@ -229,7 +203,7 @@ class BezrealitkyRawInput(BasePortalInput):
                 currency=currency_enum,
                 scraped_at=scraped_at,
                 location=location,
-                infrastructure=infrastructure,
+                infrastructure=None,
                 legal=legal,
                 land_area_m2=self.surface_land,
                 usable_area_m2=self.surface,
@@ -257,7 +231,7 @@ class BezrealitkyRawInput(BasePortalInput):
             currency=currency_enum,
             scraped_at=scraped_at,
             location=location,
-            infrastructure=infrastructure,
+            infrastructure=None,
             legal=legal,
             land_area_m2=self.surface_land,
             usable_area_m2=self.surface,
