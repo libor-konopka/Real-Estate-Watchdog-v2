@@ -7,6 +7,7 @@ from src.transformations.gold import (
     compute_market_metrics,
 )
 from src.transformations.silver import (
+    calculate_lifecycle_and_deduplicate,
     compute_derived_metrics,
     match_cross_portal_duplicates,
 )
@@ -29,6 +30,37 @@ def test_compute_derived_metrics_handles_buildings_and_land() -> None:
     assert prices_per_m2[0] == 100_000.0
     assert prices_per_m2[1] == 2_000.0
     assert prices_per_m2[2] is None
+
+
+def test_lifecycle_preserves_attributes_across_tombstones() -> None:
+    t0 = datetime(2026, 11, 1, 10, 0, tzinfo=UTC)
+    t1 = datetime(2026, 11, 5, 10, 0, tzinfo=UTC)
+
+    df = pl.DataFrame(
+        {
+            "id": ["hash_1", "hash_1"],
+            "source": ["bazos", "bazos"],
+            "source_id": ["19837261", "19837261"],
+            "title": ["Prodej bytu 3+kk", "[DEACTIVATED]"],
+            "is_active": [True, False],
+            "price": [4_850_000.0, None],
+            "usable_area_m2": [74.0, None],
+            "district": ["Příbram", None],
+            "scraped_at": [t0, t1],
+        }
+    )
+
+    deduped = calculate_lifecycle_and_deduplicate(df)
+
+    assert deduped.height == 1
+    row = deduped.to_dicts()[0]
+    assert row["is_active"] is False
+    assert row["title"] == "Prodej bytu 3+kk"
+    assert row["price"] == 4_850_000.0
+    assert row["usable_area_m2"] == 74.0
+    assert row["district"] == "Příbram"
+    assert row["first_seen_at"] == t0
+    assert row["last_seen_at"] == t1
 
 
 def test_match_cross_portal_duplicates_links_identical_listing() -> None:
@@ -56,34 +88,76 @@ def test_match_cross_portal_duplicates_links_identical_listing() -> None:
         )
     )
 
+    assert deduped.height == 3
     assert canonical_map["a_bazos"] == "a_bazos"
     assert canonical_map["b_bezrealitky"] == "a_bazos"
     assert canonical_map["c_distinct"] == "c_distinct"
+
+
+def test_match_cross_portal_duplicates_skips_unknown_city_without_gps() -> None:
+    df = pl.DataFrame(
+        {
+            "id": ["a_bazos", "b_bezrealitky"],
+            "source": ["bazos", "bezrealitky"],
+            "municipality": [None, None],
+            "transaction_type": ["sale", "sale"],
+            "entity_type": ["apartment", "apartment"],
+            "price": [4_500_000.0, 4_550_000.0],
+            "usable_area_m2": [68.0, 68.5],
+            "land_area_m2": [None, None],
+            "latitude": pl.Series([None, None], dtype=pl.Float64),
+            "longitude": pl.Series([None, None], dtype=pl.Float64),
+        }
+    )
+
+    deduped = match_cross_portal_duplicates(df)
+    assert deduped["canonical_property_id"].to_list() == ["a_bazos", "b_bezrealitky"]
 
 
 def test_gold_metrics_and_investment_opportunities() -> None:
     now = datetime.now(UTC)
     earlier = now - timedelta(days=10)
 
-    # 5 apartments in Příbram: median price_per_m2 = 60 000 Kč, one bargain at 42 000 Kč (30% discount)
+    # Includes a 1 Kč placeholder listing that must be ignored by Gold benchmarks
     silver_df = pl.DataFrame(
         {
-            "id": ["1", "2", "3", "4", "5"],
-            "canonical_property_id": ["1", "2", "3", "4", "5"],
-            "source": ["bazos", "bezrealitky", "bezrealitky", "bazos", "bezrealitky"],
-            "title": ["Byt 1", "Byt 2", "Byt 3", "Byt 4", "Výhodný byt 5"],
-            "url": [f"https://example.com/{i}" for i in range(1, 6)],
-            "region": ["Středočeský"] * 5,
-            "district": ["Příbram"] * 5,
-            "municipality": ["Příbram"] * 5,
-            "transaction_type": ["sale"] * 5,
-            "entity_type": ["apartment"] * 5,
-            "is_active": [True] * 5,
-            "price": [3_000_000.0, 3_600_000.0, 3_900_000.0, 4_200_000.0, 2_520_000.0],
-            "usable_area_m2": [50.0, 60.0, 60.0, 60.0, 60.0],
-            "price_per_m2": [60_000.0, 60_000.0, 65_000.0, 70_000.0, 42_000.0],
-            "first_seen_at": [earlier] * 5,
-            "last_seen_at": [now] * 5,
+            "id": ["1", "2", "3", "4", "5", "6_placeholder"],
+            "canonical_property_id": ["1", "2", "3", "4", "5", "6_placeholder"],
+            "source": [
+                "bazos",
+                "bezrealitky",
+                "bezrealitky",
+                "bazos",
+                "bezrealitky",
+                "bazos",
+            ],
+            "title": [
+                "Byt 1",
+                "Byt 2",
+                "Byt 3",
+                "Byt 4",
+                "Výhodný byt 5",
+                "Zástupná cena",
+            ],
+            "url": [f"https://example.com/{i}" for i in range(1, 7)],
+            "region": ["Středočeský"] * 6,
+            "district": ["Příbram"] * 6,
+            "municipality": ["Příbram"] * 6,
+            "transaction_type": ["sale"] * 6,
+            "entity_type": ["apartment"] * 6,
+            "is_active": [True] * 6,
+            "price": [
+                3_000_000.0,
+                3_600_000.0,
+                3_900_000.0,
+                4_200_000.0,
+                2_520_000.0,
+                1.0,
+            ],
+            "usable_area_m2": [50.0, 60.0, 60.0, 60.0, 60.0, 60.0],
+            "price_per_m2": [60_000.0, 60_000.0, 65_000.0, 70_000.0, 42_000.0, 0.02],
+            "first_seen_at": [earlier] * 6,
+            "last_seen_at": [now] * 6,
         }
     )
 

@@ -9,13 +9,17 @@ from src.scrapers.bazos_parser import BazosDOMParser
 CATALOG_HTML = """
 <div class="inzeraty inzeratyflex">
     <div class="inzeratynadpis">
-        <h2 class="nadpis"><a href="/inzerat/19837261/prodej-bytu-3kk.php">Prodej bytu 3+kk 74 m²</a></h2>
+        <h2 class="nadpis">
+            <a href="/inzerat/19837261/prodej-bytu-3kk.php">Prodej bytu 3+kk 74 m²</a>
+        </h2>
     </div>
     <div class="inzeratycena"><b>4 850 000 Kč</b></div>
 </div>
 <div class="inzeraty inzeratyflex">
     <div class="inzeratynadpis">
-        <h2 class="nadpis"><a href="/inzerat/19837262/pronajem-garaze.php">Pronájem garáže</a></h2>
+        <h2 class="nadpis">
+            <a href="/inzerat/19837262/pronajem-garaze.php">Pronájem garáže</a>
+        </h2>
     </div>
     <div class="inzeratycena"><b>Dohodou</b></div>
 </div>
@@ -74,3 +78,27 @@ def test_detail_parser_extracts_structured_attributes() -> None:
     assert parser.extract_energy_class(combined) == EnergyClass.B
     assert legal.ownership == OwnershipType.PERSONAL
     assert legal.is_foreclosure is False
+
+
+def test_extract_land_area_does_not_double_count_repeated_mentions() -> None:
+    html = """
+    <html>
+    <body>
+        <h1 class="nadpisdetail">Prodej stavebního pozemku 850 m²</h1>
+        <div class="popisdetail">
+            Nabízíme stavební pozemek 850 m² v klidné části obce.
+            Plocha parcely: 850 m2.
+        </div>
+    </body>
+    </html>
+    """
+    parser = BazosDOMParser(html, "https://reality.bazos.cz/inzerat/999/pozemek.php")
+
+    land_area = parser.extract_land_area(
+        parser.extract_title(), parser.extract_description()
+    )
+    assert land_area == 850.0
+
+    empty_loc = parser.extract_location()
+    assert empty_loc.municipality is None
+    assert empty_loc.postal_code is None
